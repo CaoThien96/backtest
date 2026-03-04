@@ -1,5 +1,7 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { createChart, LineStyle } from "lightweight-charts";
+import { STRATEGIES, STRATEGY_MAP, getDefaultParams } from "./src/strategies/index.js";
+import { runBacktest } from "./src/backtest/engine.js";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const TIMEFRAMES = [
@@ -25,15 +27,13 @@ const THEME = {
   blue: "#2962ff",
 };
 
-// Ngưỡng: khi visible logical range bắt đầu < PREFETCH_THRESHOLD → fetch thêm
 const PREFETCH_THRESHOLD = 50;
 
-// ─── Normalize Bybit kline response ──────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 function normalizeList(list) {
-  // list từ Bybit là newest-first → reverse
   return list.reverse().map((c) => ({
-    timestamp: parseInt(c[0]),               // ms
-    time: Math.floor(parseInt(c[0]) / 1000), // giây — cho lightweight-charts
+    timestamp: parseInt(c[0]),
+    time: Math.floor(parseInt(c[0]) / 1000),
     open: parseFloat(c[1]),
     high: parseFloat(c[2]),
     low: parseFloat(c[3]),
@@ -42,13 +42,30 @@ function normalizeList(list) {
   }));
 }
 
-// ─── Hook: quản lý candle data + load more ───────────────────────────────────
+function formatDateTime(timestampMs) {
+  if (!timestampMs) return "—";
+  return new Date(timestampMs).toLocaleString("en-US", {
+    month: "short", day: "2-digit", year: "numeric",
+    hour: "2-digit", minute: "2-digit", hour12: false,
+  });
+}
+
+function formatPrice(val) {
+  if (val == null) return "—";
+  return val.toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+}
+
+function formatPnL(val, percent) {
+  if (val == null) return "—";
+  const sign = val >= 0 ? "+" : "";
+  return `${sign}${formatPrice(val)} (${sign}${percent?.toFixed(2)}%)`;
+}
+
+// ─── Hook: candle data + load more ───────────────────────────────────────────
 function useCandleData(symbol = "BTCUSDT", interval = "15") {
   const [candles, setCandles] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-
-  // Dùng ref để tránh stale closure trong subscription callback
   const loadingMoreRef = useRef(false);
   const hasMoreRef = useRef(true);
 
@@ -72,40 +89,69 @@ function useCandleData(symbol = "BTCUSDT", interval = "15") {
     }
   }, [symbol, interval]);
 
-  // Fetch thêm nến trước `beforeTimestampMs`
-  const fetchMore = useCallback(
-    async (beforeTimestampMs) => {
-      if (loadingMoreRef.current || !hasMoreRef.current) return;
-      loadingMoreRef.current = true;
-      try {
-        // end = beforeTimestampMs - 1 để không lấy trùng nến đầu tiên hiện có
-        const url = `https://api.bybit.com/v5/market/kline?symbol=${symbol}&category=linear&interval=${interval}&limit=1000&end=${beforeTimestampMs - 1}`;
-        const res = await window.fetch(url);
-        const data = await res.json();
-        if (data.retCode !== 0) return;
-        const list = data.result.list;
-        if (list.length < 1000) hasMoreRef.current = false;
-        if (list.length === 0) return;
-        const older = normalizeList(list);
-        setCandles((prev) => [...older, ...prev]);
-      } catch {
-        // silent — user vẫn xem được data hiện tại
-      } finally {
-        loadingMoreRef.current = false;
-      }
-    },
-    [symbol, interval]
-  );
+  const fetchMore = useCallback(async (beforeTimestampMs) => {
+    if (loadingMoreRef.current || !hasMoreRef.current) return;
+    loadingMoreRef.current = true;
+    try {
+      const url = `https://api.bybit.com/v5/market/kline?symbol=${symbol}&category=linear&interval=${interval}&limit=1000&end=${beforeTimestampMs - 1}`;
+      const res = await window.fetch(url);
+      const data = await res.json();
+      if (data.retCode !== 0) return;
+      const list = data.result.list;
+      if (list.length < 1000) hasMoreRef.current = false;
+      if (list.length === 0) return;
+      setCandles((prev) => [...normalizeList(list), ...prev]);
+    } catch {
+      // silent
+    } finally {
+      loadingMoreRef.current = false;
+    }
+  }, [symbol, interval]);
 
-  useEffect(() => {
-    fetchInitial();
-  }, [fetchInitial]);
+  useEffect(() => { fetchInitial(); }, [fetchInitial]);
 
   return { candles, loading, error, refetch: fetchInitial, fetchMore, hasMoreRef, loadingMoreRef };
 }
 
+// ─── Component: StrategyControls ─────────────────────────────────────────────
+function StrategyControls({ selectedId, params, onStrategyChange, onParamChange }) {
+  const strategy = STRATEGY_MAP[selectedId];
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 16, padding: "8px 14px", borderBottom: `1px solid ${THEME.bgSecondary}`, flexShrink: 0, flexWrap: "wrap" }}>
+      {/* Strategy selector */}
+      <select
+        value={selectedId}
+        onChange={(e) => onStrategyChange(e.target.value)}
+        style={{ background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "3px 8px", fontSize: 12, cursor: "pointer" }}
+      >
+        {STRATEGIES.map((s) => (
+          <option key={s.id} value={s.id}>{s.name}</option>
+        ))}
+      </select>
+
+      {/* Auto-generated param inputs */}
+      {Object.entries(strategy.paramSchema).map(([key, schema]) => (
+        <label key={key} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: THEME.textSecondary }}>
+          {schema.label}
+          {schema.type === "number" && (
+            <input
+              type="number"
+              value={params[key]}
+              min={schema.min}
+              max={schema.max}
+              onChange={(e) => onParamChange(key, Number(e.target.value))}
+              style={{ width: 52, background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 12, textAlign: "center" }}
+            />
+          )}
+        </label>
+      ))}
+    </div>
+  );
+}
+
 // ─── Component: CandlestickChart ─────────────────────────────────────────────
-function CandlestickChart({ candles, fetchMore, hasMoreRef, loadingMoreRef }) {
+function CandlestickChart({ candles, signals, fetchMore, hasMoreRef, loadingMoreRef }) {
   const containerRef = useRef(null);
   const chartRef = useRef(null);
   const candleSeriesRef = useRef(null);
@@ -113,7 +159,6 @@ function CandlestickChart({ candles, fetchMore, hasMoreRef, loadingMoreRef }) {
   const priceLineRef = useRef(null);
   const isFirstDataRef = useRef(true);
 
-  // Ref để subscription callback đọc được giá trị mới nhất mà không cần re-subscribe
   const candlesRef = useRef(candles);
   const fetchMoreRef = useRef(fetchMore);
   useEffect(() => { candlesRef.current = candles; }, [candles]);
@@ -122,7 +167,7 @@ function CandlestickChart({ candles, fetchMore, hasMoreRef, loadingMoreRef }) {
   const [hoveredBar, setHoveredBar] = useState(null);
   const [activeTimeframe, setActiveTimeframe] = useState("5D");
 
-  // ── Init chart MỘT LẦN ──────────────────────────────────────────────────────
+  // ── Init chart một lần ──────────────────────────────────────────────────────
   useEffect(() => {
     if (!containerRef.current) return;
 
@@ -132,44 +177,28 @@ function CandlestickChart({ candles, fetchMore, hasMoreRef, loadingMoreRef }) {
       layout: {
         background: { color: THEME.bgPrimary },
         textColor: THEME.textPrimary,
-        fontFamily:
-          "-apple-system, BlinkMacSystemFont, 'Trebuchet MS', Roboto, Ubuntu, sans-serif",
+        fontFamily: "-apple-system, BlinkMacSystemFont, 'Trebuchet MS', Roboto, Ubuntu, sans-serif",
       },
-      grid: {
-        vertLines: { color: THEME.bgSecondary },
-        horzLines: { color: THEME.bgSecondary },
-      },
+      grid: { vertLines: { color: THEME.bgSecondary }, horzLines: { color: THEME.bgSecondary } },
       crosshair: { mode: 0 },
       rightPriceScale: { borderColor: THEME.border },
-      timeScale: {
-        borderColor: THEME.border,
-        timeVisible: true,
-        secondsVisible: false,
-      },
+      timeScale: { borderColor: THEME.border, timeVisible: true, secondsVisible: false },
     });
 
-    // Candlestick series
     const candleSeries = chart.addCandlestickSeries({
-      upColor: THEME.green,
-      downColor: THEME.red,
-      borderUpColor: THEME.green,
-      borderDownColor: THEME.red,
-      wickUpColor: THEME.green,
-      wickDownColor: THEME.red,
+      upColor: THEME.green, downColor: THEME.red,
+      borderUpColor: THEME.green, borderDownColor: THEME.red,
+      wickUpColor: THEME.green, wickDownColor: THEME.red,
     });
 
-    // Volume histogram
     const volSeries = chart.addHistogramSeries({
       priceScaleId: "volume",
       priceFormat: { type: "volume" },
       lastValueVisible: false,
       priceLineVisible: false,
     });
-    volSeries.priceScale().applyOptions({
-      scaleMargins: { top: 0.8, bottom: 0 },
-    });
+    volSeries.priceScale().applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
 
-    // OHLCV header khi hover
     chart.subscribeCrosshairMove((param) => {
       if (param.time) {
         const bar = param.seriesData?.get(candleSeries);
@@ -179,7 +208,6 @@ function CandlestickChart({ candles, fetchMore, hasMoreRef, loadingMoreRef }) {
       }
     });
 
-    // Scroll sang trái → load more
     chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
       if (!range) return;
       if (range.from < PREFETCH_THRESHOLD) {
@@ -188,14 +216,8 @@ function CandlestickChart({ candles, fetchMore, hasMoreRef, loadingMoreRef }) {
       }
     });
 
-    // Responsive resize
     const ro = new ResizeObserver(() => {
-      if (containerRef.current) {
-        chart.resize(
-          containerRef.current.offsetWidth,
-          containerRef.current.offsetHeight
-        );
-      }
+      if (containerRef.current) chart.resize(containerRef.current.offsetWidth, containerRef.current.offsetHeight);
     });
     ro.observe(containerRef.current);
 
@@ -203,186 +225,105 @@ function CandlestickChart({ candles, fetchMore, hasMoreRef, loadingMoreRef }) {
     candleSeriesRef.current = candleSeries;
     volSeriesRef.current = volSeries;
 
-    return () => {
-      ro.disconnect();
-      chart.remove();
-      chartRef.current = null;
-      candleSeriesRef.current = null;
-      volSeriesRef.current = null;
-    };
-  }, []); // chỉ chạy 1 lần
+    return () => { ro.disconnect(); chart.remove(); };
+  }, []);
 
-  // ── Cập nhật data khi candles thay đổi ───────────────────────────────────
+  // ── Cập nhật candle data ────────────────────────────────────────────────────
   useEffect(() => {
-    const candleSeries = candleSeriesRef.current;
-    const volSeries = volSeriesRef.current;
+    const cs = candleSeriesRef.current;
+    const vs = volSeriesRef.current;
     const chart = chartRef.current;
-    if (!candleSeries || !volSeries || candles.length === 0) return;
+    if (!cs || !vs || candles.length === 0) return;
 
-    candleSeries.setData(
-      candles.map((c) => ({
-        time: c.time,
-        open: c.open,
-        high: c.high,
-        low: c.low,
-        close: c.close,
-      }))
-    );
+    cs.setData(candles.map((c) => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close })));
+    vs.setData(candles.map((c) => ({ time: c.time, value: c.volume, color: c.close >= c.open ? `${THEME.green}55` : `${THEME.red}55` })));
 
-    volSeries.setData(
-      candles.map((c) => ({
-        time: c.time,
-        value: c.volume,
-        color: c.close >= c.open ? `${THEME.green}55` : `${THEME.red}55`,
-      }))
-    );
-
-    // Cập nhật current price line
-    if (priceLineRef.current) {
-      candleSeries.removePriceLine(priceLineRef.current);
-    }
-    priceLineRef.current = candleSeries.createPriceLine({
+    if (priceLineRef.current) cs.removePriceLine(priceLineRef.current);
+    priceLineRef.current = cs.createPriceLine({
       price: candles[candles.length - 1].close,
       color: THEME.textSecondary,
       lineWidth: 1,
       lineStyle: LineStyle.Dashed,
       axisLabelVisible: true,
-      title: "",
     });
 
-    // Lần đầu có data → fitContent
     if (isFirstDataRef.current && chart) {
       chart.timeScale().fitContent();
       isFirstDataRef.current = false;
     }
   }, [candles]);
 
-  // ── Timeframe buttons ────────────────────────────────────────────────────
-  const handleTimeframe = useCallback(
-    (tf) => {
-      setActiveTimeframe(tf.label);
-      const chart = chartRef.current;
-      if (!chart) return;
+  // ── Cập nhật signal markers ─────────────────────────────────────────────────
+  useEffect(() => {
+    const cs = candleSeriesRef.current;
+    if (!cs) return;
 
-      if (tf.label === "All") {
-        chart.timeScale().fitContent();
-        return;
-      }
+    const markers = signals.map((sig) => ({
+      time: sig.time,
+      position: sig.type === "long" ? "belowBar" : "aboveBar",
+      color: sig.type === "long" ? THEME.blue : THEME.red,
+      shape: sig.type === "long" ? "arrowUp" : "arrowDown",
+      text: sig.label,
+    }));
 
-      const nowSec = Math.floor(Date.now() / 1000);
-      let fromSec;
+    // lightweight-charts requires markers sorted by time
+    markers.sort((a, b) => a.time - b.time);
+    cs.setMarkers(markers);
+  }, [signals]);
 
-      if (tf.label === "YTD") {
-        fromSec = Math.floor(new Date(new Date().getFullYear(), 0, 1).getTime() / 1000);
-      } else {
-        fromSec = nowSec - tf.days * 24 * 3600;
-      }
+  // ── Timeframe buttons ────────────────────────────────────────────────────────
+  const handleTimeframe = useCallback((tf) => {
+    setActiveTimeframe(tf.label);
+    const chart = chartRef.current;
+    if (!chart) return;
 
-      if (candles.length > 0) {
-        fromSec = Math.max(fromSec, candles[0].time);
-      }
+    if (tf.label === "All") { chart.timeScale().fitContent(); return; }
 
-      chart.timeScale().setVisibleRange({ from: fromSec, to: nowSec });
-    },
-    [candles]
-  );
+    const nowSec = Math.floor(Date.now() / 1000);
+    let fromSec = tf.label === "YTD"
+      ? Math.floor(new Date(new Date().getFullYear(), 0, 1).getTime() / 1000)
+      : nowSec - tf.days * 24 * 3600;
 
-  const displayBar =
-    hoveredBar ?? (candles.length > 0 ? candles[candles.length - 1] : null);
+    if (candles.length > 0) fromSec = Math.max(fromSec, candles[0].time);
+    chart.timeScale().setVisibleRange({ from: fromSec, to: nowSec });
+  }, [candles]);
+
+  const displayBar = hoveredBar ?? (candles.length > 0 ? candles[candles.length - 1] : null);
   const barUp = displayBar ? displayBar.close >= displayBar.open : true;
   const barColor = barUp ? THEME.green : THEME.red;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", background: THEME.bgPrimary }}>
-
-      {/* ── Header ──────────────────────────────────────────────────────────── */}
-      <div
-        style={{
-          padding: "8px 14px",
-          display: "flex",
-          alignItems: "center",
-          gap: 16,
-          borderBottom: `1px solid ${THEME.bgSecondary}`,
-          flexShrink: 0,
-          userSelect: "none",
-        }}
-      >
-        <span style={{ color: THEME.textPrimary, fontWeight: 700, fontSize: 13, letterSpacing: "0.02em" }}>
-          BTCUSDT · 15m
-        </span>
-
+      {/* Header */}
+      <div style={{ padding: "8px 14px", display: "flex", alignItems: "center", gap: 16, borderBottom: `1px solid ${THEME.bgSecondary}`, flexShrink: 0, userSelect: "none" }}>
+        <span style={{ color: THEME.textPrimary, fontWeight: 700, fontSize: 13 }}>BTCUSDT · 15m</span>
         {displayBar && (
           <div style={{ display: "flex", gap: 10, fontSize: 12, fontFamily: "'Source Code Pro', monospace" }}>
-            {[["O", displayBar.open], ["H", displayBar.high], ["L", displayBar.low], ["C", displayBar.close]].map(
-              ([label, val]) => (
-                <span key={label} style={{ color: THEME.textSecondary }}>
-                  {label} <span style={{ color: barColor }}>{val?.toFixed(1)}</span>
-                </span>
-              )
-            )}
-            {displayBar.volume != null && (
-              <span style={{ color: THEME.textSecondary }}>
-                Vol <span style={{ color: THEME.textPrimary }}>{displayBar.volume?.toFixed(2)}</span>
+            {[["O", displayBar.open], ["H", displayBar.high], ["L", displayBar.low], ["C", displayBar.close]].map(([label, val]) => (
+              <span key={label} style={{ color: THEME.textSecondary }}>
+                {label} <span style={{ color: barColor }}>{val?.toFixed(1)}</span>
               </span>
+            ))}
+            {displayBar.volume != null && (
+              <span style={{ color: THEME.textSecondary }}>Vol <span style={{ color: THEME.textPrimary }}>{displayBar.volume?.toFixed(2)}</span></span>
             )}
           </div>
         )}
-
-        {/* Loading more indicator */}
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6 }}>
-          {loadingMoreRef.current && (
-            <>
-              <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
-              <div
-                style={{
-                  width: 12,
-                  height: 12,
-                  border: `2px solid ${THEME.border}`,
-                  borderTopColor: THEME.blue,
-                  borderRadius: "50%",
-                  animation: "spin 0.75s linear infinite",
-                }}
-              />
-              <span style={{ color: THEME.textSecondary, fontSize: 11 }}>Tải thêm...</span>
-            </>
-          )}
-          {!hasMoreRef.current && candles.length > 0 && (
-            <span style={{ color: THEME.textSecondary, fontSize: 11 }}>Đã tải hết dữ liệu</span>
-          )}
+        <div style={{ marginLeft: "auto", fontSize: 11, color: THEME.textSecondary }}>
+          {loadingMoreRef.current && "Tải thêm..."}
+          {!hasMoreRef.current && candles.length > 0 && "Đã tải hết"}
         </div>
       </div>
 
-      {/* ── Chart ───────────────────────────────────────────────────────────── */}
+      {/* Chart */}
       <div ref={containerRef} style={{ flex: 1, position: "relative" }} />
 
-      {/* ── Timeframe selector ──────────────────────────────────────────────── */}
-      <div
-        style={{
-          display: "flex",
-          gap: 2,
-          padding: "6px 12px",
-          borderTop: `1px solid ${THEME.bgSecondary}`,
-          flexShrink: 0,
-        }}
-      >
+      {/* Timeframe selector */}
+      <div style={{ display: "flex", gap: 2, padding: "6px 12px", borderTop: `1px solid ${THEME.bgSecondary}`, flexShrink: 0 }}>
         {TIMEFRAMES.map((tf) => {
           const active = activeTimeframe === tf.label;
           return (
-            <button
-              key={tf.label}
-              onClick={() => handleTimeframe(tf)}
-              style={{
-                padding: "3px 9px",
-                fontSize: 12,
-                background: active ? THEME.bgTertiary : "transparent",
-                color: active ? THEME.textPrimary : THEME.textSecondary,
-                border: "none",
-                borderRadius: 4,
-                cursor: "pointer",
-                fontFamily: "inherit",
-                fontWeight: active ? 600 : 400,
-              }}
-            >
+            <button key={tf.label} onClick={() => handleTimeframe(tf)} style={{ padding: "3px 9px", fontSize: 12, background: active ? THEME.bgTertiary : "transparent", color: active ? THEME.textPrimary : THEME.textSecondary, border: "none", borderRadius: 4, cursor: "pointer", fontFamily: "inherit", fontWeight: active ? 600 : 400 }}>
               {tf.label}
             </button>
           );
@@ -392,7 +333,161 @@ function CandlestickChart({ candles, fetchMore, hasMoreRef, loadingMoreRef }) {
   );
 }
 
-// ─── Component: Loading ───────────────────────────────────────────────────────
+// ─── Component: TradeTable ────────────────────────────────────────────────────
+function TradeTable({ trades }) {
+  if (trades.length === 0) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: THEME.textSecondary, fontSize: 13 }}>
+        Chưa có tín hiệu giao dịch
+      </div>
+    );
+  }
+
+  const sorted = [...trades].reverse(); // newest first
+
+  const colStyle = { padding: "6px 10px", fontSize: 11, whiteSpace: "nowrap" };
+  const thStyle = { ...colStyle, color: THEME.textSecondary, fontWeight: 500, background: THEME.bgSecondary, position: "sticky", top: 0, zIndex: 1 };
+
+  return (
+    <div style={{ overflowY: "auto", height: "100%" }}>
+      <table style={{ width: "100%", borderCollapse: "collapse", tableLayout: "fixed" }}>
+        <colgroup>
+          <col style={{ width: "90px" }} />
+          <col style={{ width: "55px" }} />
+          <col style={{ width: "155px" }} />
+          <col style={{ width: "90px" }} />
+          <col style={{ width: "105px" }} />
+          <col style={{ width: "100px" }} />
+          <col style={{ width: "145px" }} />
+          <col style={{ width: "130px" }} />
+          <col style={{ width: "130px" }} />
+          <col style={{ width: "130px" }} />
+        </colgroup>
+        <thead>
+          <tr>
+            {["Trade #", "Type", "Date & Time", "Signal", "Price", "Qty / Value", "Net P&L", "MFE", "MAE", "Cum. P&L"].map((h) => (
+              <th key={h} style={{ ...thStyle, textAlign: "left", borderBottom: `1px solid ${THEME.border}` }}>{h}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {sorted.map((trade) => {
+            const pnlColor = trade.netPnL >= 0 ? THEME.green : THEME.red;
+            const cumColor = trade.cumulativePnL >= 0 ? THEME.green : THEME.red;
+            const badgeColor = trade.type === "Long" ? THEME.blue : THEME.red;
+            const rowBg = THEME.bgPrimary;
+            const rowBgAlt = `${THEME.bgSecondary}88`;
+
+            return (
+              <>
+                {/* Row 1: Exit */}
+                <tr key={`${trade.tradeNumber}-exit`} style={{ background: rowBgAlt, borderTop: `1px solid ${THEME.border}` }}>
+                  <td style={{ ...colStyle, verticalAlign: "middle" }} rowSpan={2}>
+                    <div style={{ fontWeight: 600, color: THEME.textPrimary, fontSize: 12 }}>#{trade.tradeNumber}</div>
+                    <div style={{ color: badgeColor, fontSize: 10, fontWeight: 600 }}>{trade.type.toUpperCase()}</div>
+                  </td>
+                  <td style={{ ...colStyle, color: THEME.textSecondary }}>Exit</td>
+                  <td style={{ ...colStyle, color: THEME.textPrimary }}>
+                    {trade.isOpen ? <span style={{ color: THEME.textSecondary }}>Open</span> : formatDateTime(trade.exitTimestamp)}
+                  </td>
+                  <td style={{ ...colStyle, color: THEME.textSecondary }}>
+                    {trade.isOpen ? <span style={{ color: THEME.textSecondary }}>Open</span> : (trade.exitSignal ?? "—")}
+                  </td>
+                  <td style={{ ...colStyle, color: THEME.textPrimary, textAlign: "right" }}>
+                    {trade.isOpen
+                      ? <span style={{ color: THEME.textSecondary }}>—</span>
+                      : <>{formatPrice(trade.exitPrice)} <span style={{ color: THEME.textSecondary, fontSize: 10 }}>USDT</span></>}
+                  </td>
+                  {/* Span rows */}
+                  <td style={{ ...colStyle, textAlign: "center", color: THEME.textPrimary }} rowSpan={2}>
+                    {trade.positionSize} <span style={{ color: THEME.textSecondary, fontSize: 10 }}>/ {(trade.positionValue / 1000).toFixed(1)}K</span>
+                  </td>
+                  <td style={{ ...colStyle, textAlign: "right", color: pnlColor }} rowSpan={2}>
+                    {trade.isOpen ? <span style={{ color: THEME.textSecondary }}>unrealized</span> : null}
+                    <div>{trade.netPnL >= 0 ? "+" : ""}{formatPrice(trade.netPnL)}</div>
+                    <div style={{ fontSize: 10 }}>{trade.netPnL >= 0 ? "+" : ""}{trade.netPnLPercent?.toFixed(2)}%</div>
+                  </td>
+                  <td style={{ ...colStyle, textAlign: "right", color: THEME.green }} rowSpan={2}>
+                    <div>+{formatPrice(trade.favorableExcursion)}</div>
+                    <div style={{ fontSize: 10 }}>+{trade.favorableExcursionPercent?.toFixed(2)}%</div>
+                  </td>
+                  <td style={{ ...colStyle, textAlign: "right", color: THEME.red }} rowSpan={2}>
+                    <div>{formatPrice(trade.adverseExcursion)}</div>
+                    <div style={{ fontSize: 10 }}>{trade.adverseExcursionPercent?.toFixed(2)}%</div>
+                  </td>
+                  <td style={{ ...colStyle, textAlign: "right", color: cumColor }} rowSpan={2}>
+                    <div>{trade.cumulativePnL >= 0 ? "+" : ""}{formatPrice(trade.cumulativePnL)}</div>
+                    <div style={{ fontSize: 10 }}>{trade.cumulativePnLPercent?.toFixed(2)}%</div>
+                  </td>
+                </tr>
+
+                {/* Row 2: Entry */}
+                <tr key={`${trade.tradeNumber}-entry`} style={{ background: rowBg }}>
+                  <td style={{ ...colStyle, color: THEME.textSecondary }}>Entry</td>
+                  <td style={{ ...colStyle, color: THEME.textPrimary }}>{formatDateTime(trade.entryTimestamp)}</td>
+                  <td style={{ ...colStyle, color: THEME.textSecondary }}>{trade.entrySignal}</td>
+                  <td style={{ ...colStyle, color: THEME.textPrimary, textAlign: "right" }}>
+                    {formatPrice(trade.entryPrice)} <span style={{ color: THEME.textSecondary, fontSize: 10 }}>USDT</span>
+                  </td>
+                </tr>
+              </>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ─── Component: StrategyReport ────────────────────────────────────────────────
+function StrategyReport({ trades, strategyName }) {
+  const [activeTab, setActiveTab] = useState("trades");
+
+  const winTrades = trades.filter((t) => !t.isOpen && t.netPnL > 0).length;
+  const closedTrades = trades.filter((t) => !t.isOpen).length;
+  const totalPnL = trades.reduce((sum, t) => (!t.isOpen ? sum + t.netPnL : sum), 0);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: THEME.bgPrimary, borderTop: `1px solid ${THEME.border}` }}>
+      {/* Panel header */}
+      <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 14px", borderBottom: `1px solid ${THEME.bgSecondary}`, flexShrink: 0 }}>
+        <span style={{ color: THEME.textPrimary, fontWeight: 600, fontSize: 13 }}>{strategyName}</span>
+        <div style={{ marginLeft: "auto", display: "flex", gap: 16, fontSize: 11, color: THEME.textSecondary }}>
+          <span>{closedTrades} trades</span>
+          <span>Win rate: {closedTrades ? Math.round((winTrades / closedTrades) * 100) : 0}%</span>
+          <span style={{ color: totalPnL >= 0 ? THEME.green : THEME.red, fontWeight: 600 }}>
+            Total P&L: {totalPnL >= 0 ? "+" : ""}{formatPrice(totalPnL)} USDT
+          </span>
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div style={{ display: "flex", gap: 0, borderBottom: `1px solid ${THEME.bgSecondary}`, flexShrink: 0 }}>
+        {[{ id: "trades", label: "List of Trades" }, { id: "metrics", label: "Metrics" }].map((tab) => (
+          <button
+            key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            style={{ padding: "7px 16px", fontSize: 12, background: "transparent", color: activeTab === tab.id ? THEME.textPrimary : THEME.textSecondary, border: "none", borderBottom: activeTab === tab.id ? `2px solid ${THEME.blue}` : "2px solid transparent", cursor: "pointer", fontFamily: "inherit", fontWeight: activeTab === tab.id ? 600 : 400 }}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Tab content */}
+      <div style={{ flex: 1, overflow: "hidden" }}>
+        {activeTab === "trades" && <TradeTable trades={trades} />}
+        {activeTab === "metrics" && (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: THEME.textSecondary, fontSize: 13 }}>
+            Metrics — coming soon
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Component: Loading / Error ───────────────────────────────────────────────
 function Loading() {
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100vh", background: THEME.bgPrimary, gap: 12 }}>
@@ -403,14 +498,11 @@ function Loading() {
   );
 }
 
-// ─── Component: Error ─────────────────────────────────────────────────────────
 function ErrorState({ message, onRetry }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100vh", background: THEME.bgPrimary, gap: 12 }}>
-      <span style={{ color: THEME.red, fontSize: 13 }}>Lỗi khi tải dữ liệu: {message}</span>
-      <button onClick={onRetry} style={{ padding: "6px 18px", background: THEME.blue, color: "#fff", border: "none", borderRadius: 4, cursor: "pointer", fontSize: 13 }}>
-        Thử lại
-      </button>
+      <span style={{ color: THEME.red, fontSize: 13 }}>Lỗi: {message}</span>
+      <button onClick={onRetry} style={{ padding: "6px 18px", background: THEME.blue, color: "#fff", border: "none", borderRadius: 4, cursor: "pointer", fontSize: 13 }}>Thử lại</button>
     </div>
   );
 }
@@ -420,17 +512,59 @@ export default function App() {
   const { candles, loading, error, refetch, fetchMore, hasMoreRef, loadingMoreRef } =
     useCandleData("BTCUSDT", "15");
 
+  // Strategy state
+  const [selectedStrategyId, setSelectedStrategyId] = useState(STRATEGIES[0].id);
+  const [strategyParams, setStrategyParams] = useState(getDefaultParams(STRATEGIES[0]));
+
+  // Cập nhật params khi đổi strategy
+  const handleStrategyChange = (id) => {
+    setSelectedStrategyId(id);
+    setStrategyParams(getDefaultParams(STRATEGY_MAP[id]));
+  };
+
+  const handleParamChange = (key, val) => {
+    setStrategyParams((prev) => ({ ...prev, [key]: val }));
+  };
+
+  // Chạy backtest mỗi khi candles hoặc params thay đổi
+  const { signals, trades } = useMemo(() => {
+    if (candles.length === 0) return { signals: [], trades: [] };
+    const strategy = STRATEGY_MAP[selectedStrategyId];
+    const sigs = strategy.generateSignals(candles, strategyParams);
+    const trs = runBacktest(candles, sigs);
+    return { signals: sigs, trades: trs };
+  }, [candles, selectedStrategyId, strategyParams]);
+
   if (loading) return <Loading />;
   if (error) return <ErrorState message={error} onRetry={refetch} />;
 
+  const strategy = STRATEGY_MAP[selectedStrategyId];
+
   return (
-    <div style={{ height: "100vh", background: THEME.bgPrimary }}>
-      <CandlestickChart
-        candles={candles}
-        fetchMore={fetchMore}
-        hasMoreRef={hasMoreRef}
-        loadingMoreRef={loadingMoreRef}
+    <div style={{ display: "flex", flexDirection: "column", height: "100vh", background: THEME.bgPrimary }}>
+      {/* Strategy controls */}
+      <StrategyControls
+        selectedId={selectedStrategyId}
+        params={strategyParams}
+        onStrategyChange={handleStrategyChange}
+        onParamChange={handleParamChange}
       />
+
+      {/* Chart — 60% height */}
+      <div style={{ flex: "0 0 60%", overflow: "hidden" }}>
+        <CandlestickChart
+          candles={candles}
+          signals={signals}
+          fetchMore={fetchMore}
+          hasMoreRef={hasMoreRef}
+          loadingMoreRef={loadingMoreRef}
+        />
+      </div>
+
+      {/* Strategy report — 40% height */}
+      <div style={{ flex: "0 0 40%", overflow: "hidden" }}>
+        <StrategyReport trades={trades} strategyName={strategy.name} />
+      </div>
     </div>
   );
 }
