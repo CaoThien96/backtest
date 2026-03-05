@@ -31,7 +31,7 @@ const PREFETCH_THRESHOLD = 50;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function normalizeList(list) {
-  return list.reverse().map((c) => ({
+  return [...list].reverse().map((c) => ({
     timestamp: parseInt(c[0]),
     time: Math.floor(parseInt(c[0]) / 1000),
     open: parseFloat(c[1]),
@@ -100,7 +100,13 @@ function useCandleData(symbol = "BTCUSDT", interval = "15") {
       const list = data.result.list;
       if (list.length < 1000) hasMoreRef.current = false;
       if (list.length === 0) return;
-      setCandles((prev) => [...normalizeList(list), ...prev]);
+      const older = normalizeList(list);
+      setCandles((prev) => {
+        // Filter candles đã có để tránh trùng lặp khi race condition
+        const prevOldestTime = prev.length > 0 ? prev[0].time : Infinity;
+        const filtered = older.filter((c) => c.time < prevOldestTime);
+        return filtered.length > 0 ? [...filtered, ...prev] : prev;
+      });
     } catch {
       // silent
     } finally {
@@ -151,7 +157,7 @@ function StrategyControls({ selectedId, params, onStrategyChange, onParamChange 
 }
 
 // ─── Component: CandlestickChart ─────────────────────────────────────────────
-function CandlestickChart({ candles, signals, fetchMore, hasMoreRef, loadingMoreRef }) {
+function CandlestickChart({ candles, trades, fetchMore, hasMoreRef, loadingMoreRef }) {
   const containerRef = useRef(null);
   const chartRef = useRef(null);
   const candleSeriesRef = useRef(null);
@@ -254,22 +260,23 @@ function CandlestickChart({ candles, signals, fetchMore, hasMoreRef, loadingMore
   }, [candles]);
 
   // ── Cập nhật signal markers ─────────────────────────────────────────────────
+  // Derive markers from trades (not raw signals) to avoid spurious markers
+  // from signals the engine ignored (same-direction, no pyramiding).
   useEffect(() => {
     const cs = candleSeriesRef.current;
     if (!cs) return;
 
-    const markers = signals.map((sig) => ({
-      time: sig.time,
-      position: sig.type === "long" ? "belowBar" : "aboveBar",
-      color: sig.type === "long" ? THEME.blue : THEME.red,
-      shape: sig.type === "long" ? "arrowUp" : "arrowDown",
-      text: sig.label,
+    const markers = trades.map((trade) => ({
+      time: Math.floor(trade.entryTimestamp / 1000),
+      position: trade.type === "Long" ? "belowBar" : "aboveBar",
+      color: trade.type === "Long" ? THEME.blue : THEME.red,
+      shape: trade.type === "Long" ? "arrowUp" : "arrowDown",
+      text: trade.entrySignal,
     }));
 
-    // lightweight-charts requires markers sorted by time
     markers.sort((a, b) => a.time - b.time);
     cs.setMarkers(markers);
-  }, [signals]);
+  }, [trades]);
 
   // ── Timeframe buttons ────────────────────────────────────────────────────────
   const handleTimeframe = useCallback((tf) => {
@@ -439,6 +446,317 @@ function TradeTable({ trades }) {
   );
 }
 
+// ─── Component: StatCard ─────────────────────────────────────────────────────
+function StatCard({ label, value, sub, color }) {
+  return (
+    <div style={{ background: THEME.bgTertiary, borderRadius: 6, padding: "10px 12px", border: `1px solid ${THEME.border}` }}>
+      <div style={{ fontSize: 11, color: THEME.textSecondary, marginBottom: 4 }}>{label}</div>
+      <div style={{ fontSize: 17, fontWeight: 700, color: color ?? THEME.textPrimary, lineHeight: 1.2 }}>{value}</div>
+      {sub && <div style={{ fontSize: 10, color: THEME.textSecondary, marginTop: 3 }}>{sub}</div>}
+    </div>
+  );
+}
+
+// ─── Component: EquityChart (SVG) ─────────────────────────────────────────────
+function EquityChart({ trades }) {
+  const [hoverIdx, setHoverIdx] = useState(null); // index vào equityData (0 = start)
+
+  // equityData[0] = điểm khởi đầu (0), equityData[i+1] = sau trade i
+  const equityData = [
+    { cumPnL: 0, trade: null },
+    ...trades.map((t) => ({ cumPnL: t.cumulativePnL, trade: t })),
+  ];
+
+  const eqMin = Math.min(...equityData.map((d) => d.cumPnL));
+  const eqMax = Math.max(...equityData.map((d) => d.cumPnL));
+  const eqRange = eqMax - eqMin || 1;
+
+  const W = 1000, H = 170;
+  const PAD = { top: 14, right: 14, bottom: 34, left: 72 }; // bottom tăng để có chỗ x-axis
+  const cW = W - PAD.left - PAD.right;
+  const cH = H - PAD.top - PAD.bottom;
+
+  const toX = (i) => PAD.left + (i / Math.max(equityData.length - 1, 1)) * cW;
+  const toY = (v) => PAD.top + (1 - (v - eqMin) / eqRange) * cH;
+
+  const pts = equityData.map((d, i) => [toX(i), toY(d.cumPnL)]);
+  const y0 = toY(Math.max(eqMin, Math.min(0, eqMax)));
+  const lineD = `M ${pts.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" L ")}`;
+  const areaD = `M ${toX(0).toFixed(1)},${y0.toFixed(1)} L ${pts.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" L ")} L ${toX(equityData.length - 1).toFixed(1)},${y0.toFixed(1)} Z`;
+
+  const lastVal = equityData[equityData.length - 1].cumPnL;
+
+  // X-axis: chọn ~6 tick đều nhau, hiển thị thời gian exit của trade
+  const xTickCount = Math.min(6, trades.length);
+  const xTicks = Array.from({ length: xTickCount }, (_, i) => {
+    const idx = Math.round((i / (xTickCount - 1 || 1)) * (trades.length - 1));
+    const trade = trades[idx];
+    const ts = trade.exitTimestamp ?? trade.entryTimestamp;
+    const label = ts
+      ? new Date(ts).toLocaleDateString("en-US", { month: "short", day: "numeric" })
+      : `T${idx + 1}`;
+    return { x: toX(idx + 1), label }; // +1 vì equityData[0] là origin
+  });
+
+  // Y-axis labels
+  const yLabels = [
+    { v: eqMax, label: `${eqMax >= 0 ? "+" : ""}${eqMax.toFixed(0)}` },
+    { v: (eqMax + eqMin) / 2, label: `${((eqMax + eqMin) / 2) >= 0 ? "+" : ""}${((eqMax + eqMin) / 2).toFixed(0)}` },
+    { v: eqMin, label: `${eqMin >= 0 ? "+" : ""}${eqMin.toFixed(0)}` },
+  ];
+
+  // Hover: tìm điểm gần nhất theo X
+  const handleMouseMove = (e) => {
+    const svg = e.currentTarget;
+    const rect = svg.getBoundingClientRect();
+    const mouseX = ((e.clientX - rect.left) / rect.width) * W;
+    const relX = mouseX - PAD.left;
+    const ratio = relX / cW;
+    const idx = Math.round(ratio * (equityData.length - 1));
+    setHoverIdx(Math.max(0, Math.min(equityData.length - 1, idx)));
+  };
+
+  const hovered = hoverIdx != null ? equityData[hoverIdx] : null;
+  const hovX = hoverIdx != null ? toX(hoverIdx) : null;
+  const hovY = hovered ? toY(hovered.cumPnL) : null;
+
+  // Tooltip content
+  const tooltipLines = hovered?.trade
+    ? [
+        `Trade #${hovered.trade.tradeNumber} · ${hovered.trade.type}`,
+        `P&L: ${hovered.cumPnL >= 0 ? "+" : ""}${hovered.cumPnL.toFixed(1)} USDT`,
+        formatDateTime(hovered.trade.exitTimestamp ?? hovered.trade.entryTimestamp),
+      ]
+    : [`Start`];
+
+  // Tooltip box dimensions
+  const TW = 170, TH = tooltipLines.length * 14 + 10;
+
+  return (
+    <svg
+      viewBox={`0 0 ${W} ${H}`}
+      style={{ width: "100%", display: "block", cursor: "crosshair" }}
+      onMouseMove={handleMouseMove}
+      onMouseLeave={() => setHoverIdx(null)}
+    >
+      <defs>
+        {/* Green gradient: PAD.top → y0 (positive area fades downward to zero) */}
+        <linearGradient id="eqGradGreen" x1="0" y1={PAD.top} x2="0" y2={y0} gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stopColor={THEME.green} stopOpacity="0.28" />
+          <stop offset="100%" stopColor={THEME.green} stopOpacity="0" />
+        </linearGradient>
+        {/* Red gradient: y0 → bottom (negative area fades downward from zero) */}
+        <linearGradient id="eqGradRed" x1="0" y1={y0} x2="0" y2={PAD.top + cH} gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stopColor={THEME.red} stopOpacity="0" />
+          <stop offset="100%" stopColor={THEME.red} stopOpacity="0.28" />
+        </linearGradient>
+        {/* Clip: region above zero line */}
+        <clipPath id="eqClipAbove">
+          <rect x={PAD.left} y={PAD.top} width={cW} height={Math.max(0, y0 - PAD.top)} />
+        </clipPath>
+        {/* Clip: region below zero line */}
+        <clipPath id="eqClipBelow">
+          <rect x={PAD.left} y={y0} width={cW} height={Math.max(0, PAD.top + cH - y0)} />
+        </clipPath>
+      </defs>
+
+      {/* Y grid + labels */}
+      {yLabels.map(({ v, label }) => (
+        <g key={v}>
+          <line x1={PAD.left} y1={toY(v)} x2={W - PAD.right} y2={toY(v)} stroke={THEME.bgPrimary} strokeWidth="1" />
+          <text x={PAD.left - 6} y={toY(v) + 4} textAnchor="end" fill={THEME.textSecondary} fontSize="10">{label}</text>
+        </g>
+      ))}
+
+      {/* Zero dashed line */}
+      {eqMin < 0 && eqMax > 0 && (
+        <line x1={PAD.left} y1={y0} x2={W - PAD.right} y2={y0} stroke={THEME.border} strokeWidth="1" strokeDasharray="4,4" />
+      )}
+
+      {/* X-axis baseline */}
+      <line x1={PAD.left} y1={PAD.top + cH} x2={W - PAD.right} y2={PAD.top + cH} stroke={THEME.border} strokeWidth="1" />
+
+      {/* X-axis ticks + labels */}
+      {xTicks.map(({ x, label }, i) => (
+        <g key={i}>
+          <line x1={x} y1={PAD.top + cH} x2={x} y2={PAD.top + cH + 4} stroke={THEME.border} strokeWidth="1" />
+          <text x={x} y={PAD.top + cH + 14} textAnchor="middle" fill={THEME.textSecondary} fontSize="10">{label}</text>
+        </g>
+      ))}
+
+      {/* Green area + line: positive region (above zero) */}
+      <g clipPath="url(#eqClipAbove)">
+        <path d={areaD} fill="url(#eqGradGreen)" />
+        <path d={lineD} fill="none" stroke={THEME.green} strokeWidth="1.5" />
+      </g>
+
+      {/* Red area + line: negative region (below zero) */}
+      <g clipPath="url(#eqClipBelow)">
+        <path d={areaD} fill="url(#eqGradRed)" />
+        <path d={lineD} fill="none" stroke={THEME.red} strokeWidth="1.5" />
+      </g>
+
+      {/* Last value dot */}
+      <circle cx={toX(equityData.length - 1)} cy={toY(lastVal)} r="3" fill={lastVal >= 0 ? THEME.green : THEME.red} />
+
+      {/* Hover crosshair */}
+      {hovered && hovX != null && (
+        <g>
+          {/* Vertical line */}
+          <line x1={hovX} y1={PAD.top} x2={hovX} y2={PAD.top + cH} stroke={THEME.textSecondary} strokeWidth="1" strokeDasharray="3,3" />
+          {/* Dot on line */}
+          <circle cx={hovX} cy={hovY} r="4" fill={THEME.bgPrimary} stroke={hovered.cumPnL >= 0 ? THEME.green : THEME.red} strokeWidth="2" />
+          {/* Tooltip box — flip nếu gần cạnh phải */}
+          {(() => {
+            const flip = hovX + TW + 12 > W - PAD.right;
+            const tx = flip ? hovX - TW - 8 : hovX + 8;
+            const ty = Math.max(PAD.top, Math.min(hovY - TH / 2, PAD.top + cH - TH));
+            return (
+              <g>
+                <rect x={tx} y={ty} width={TW} height={TH} rx="4" fill={THEME.bgSecondary} stroke={THEME.border} strokeWidth="1" />
+                {tooltipLines.map((line, li) => (
+                  <text key={li} x={tx + 8} y={ty + 14 + li * 14} fill={li === 0 ? THEME.textPrimary : THEME.textSecondary} fontSize="10" fontWeight={li === 0 ? 600 : 400}>
+                    {line}
+                  </text>
+                ))}
+              </g>
+            );
+          })()}
+        </g>
+      )}
+    </svg>
+  );
+}
+
+// ─── Component: ExcursionsChart (SVG) ────────────────────────────────────────
+function ExcursionsChart({ trades }) {
+  const W = 1000, H = 130;
+  const PAD = { top: 14, right: 14, bottom: 20, left: 72 };
+  const cW = W - PAD.left - PAD.right;
+  const cH = H - PAD.top - PAD.bottom;
+
+  const mfeMax = Math.max(...trades.map((t) => t.favorableExcursion), 1);
+  const maeMax = Math.max(...trades.map((t) => Math.abs(t.adverseExcursion)), 1);
+  const excMax = Math.max(mfeMax, maeMax);
+
+  const y0 = PAD.top + cH / 2;
+  const halfH = cH / 2;
+  const n = trades.length;
+  const barW = Math.max(1.5, cW / n - 2);
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", display: "block" }}>
+      {/* Y labels */}
+      {[
+        { y: PAD.top,      label: `+${excMax.toFixed(0)}` },
+        { y: y0,           label: "0" },
+        { y: PAD.top + cH, label: `-${excMax.toFixed(0)}` },
+      ].map(({ y, label }) => (
+        <g key={y}>
+          <line x1={PAD.left} y1={y} x2={W - PAD.right} y2={y} stroke={y === y0 ? THEME.border : THEME.bgPrimary} strokeWidth="1" strokeDasharray={y === y0 ? "4,4" : "0"} />
+          <text x={PAD.left - 6} y={y + 4} textAnchor="end" fill={THEME.textSecondary} fontSize="10">{label}</text>
+        </g>
+      ))}
+
+      {/* MFE / MAE bars */}
+      {trades.map((trade, i) => {
+        const x = PAD.left + (i / n) * cW + 1;
+        const mfeH = (trade.favorableExcursion / excMax) * halfH;
+        const maeH = (Math.abs(trade.adverseExcursion) / excMax) * halfH;
+        return (
+          <g key={i}>
+            <rect x={x} y={y0 - mfeH} width={barW} height={Math.max(mfeH, 0.5)} fill={`${THEME.green}99`} />
+            <rect x={x} y={y0} width={barW} height={Math.max(maeH, 0.5)} fill={`${THEME.red}99`} />
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+// ─── Component: MetricsTab ────────────────────────────────────────────────────
+function MetricsTab({ trades }) {
+  const closed = trades.filter((t) => !t.isOpen);
+
+  if (closed.length === 0) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: THEME.textSecondary, fontSize: 13 }}>
+        Chưa có dữ liệu giao dịch
+      </div>
+    );
+  }
+
+  const profitable = closed.filter((t) => t.netPnL > 0);
+  const losing = closed.filter((t) => t.netPnL <= 0);
+  const totalPnL = closed.reduce((sum, t) => sum + t.netPnL, 0);
+  const totalPnLPct = closed[closed.length - 1]?.cumulativePnLPercent ?? 0;
+  const winRate = (profitable.length / closed.length) * 100;
+  const avgWin = profitable.length ? profitable.reduce((s, t) => s + t.netPnL, 0) / profitable.length : 0;
+  const avgLoss = losing.length ? losing.reduce((s, t) => s + t.netPnL, 0) / losing.length : 0;
+  const grossProfit = profitable.reduce((s, t) => s + t.netPnL, 0);
+  const grossLoss = Math.abs(losing.reduce((s, t) => s + t.netPnL, 0));
+  const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : Infinity;
+
+  // Max drawdown từ equity curve
+  let maxDD = 0, peak = 0;
+  for (const t of closed) {
+    if (t.cumulativePnL > peak) peak = t.cumulativePnL;
+    const dd = t.cumulativePnL - peak;
+    if (dd < maxDD) maxDD = dd;
+  }
+
+  const sectionLabel = (text) => (
+    <div style={{ fontSize: 11, color: THEME.textSecondary, fontWeight: 600, marginBottom: 8, marginTop: 14, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+      {text}
+    </div>
+  );
+
+  const chartBox = { background: THEME.bgSecondary, borderRadius: 6, padding: "8px 8px 4px", border: `1px solid ${THEME.border}` };
+
+  return (
+    <div style={{ height: "100%", overflowY: "auto", padding: "12px 14px" }}>
+      {/* ── Summary stats ───────────────────────────────────────────────────── */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
+        <StatCard
+          label="Total P&L"
+          value={`${totalPnL >= 0 ? "+" : ""}${formatPrice(totalPnL)}`}
+          sub={`${totalPnLPct >= 0 ? "+" : ""}${totalPnLPct.toFixed(2)}%`}
+          color={totalPnL >= 0 ? THEME.green : THEME.red}
+        />
+        <StatCard
+          label="Total Trades"
+          value={closed.length}
+          sub={`${profitable.length} win · ${losing.length} loss`}
+        />
+        <StatCard
+          label="Profitable Trades"
+          value={`${winRate.toFixed(1)}%`}
+          sub={`Avg win ${formatPrice(avgWin)} / Avg loss ${formatPrice(avgLoss)}`}
+          color={winRate >= 50 ? THEME.green : THEME.red}
+        />
+        <StatCard
+          label="Profit Factor"
+          value={isFinite(profitFactor) ? profitFactor.toFixed(2) : "∞"}
+          sub={`Max drawdown: ${formatPrice(maxDD)}`}
+          color={profitFactor >= 1 ? THEME.green : THEME.red}
+        />
+      </div>
+
+      {/* ── Equity curve ────────────────────────────────────────────────────── */}
+      {sectionLabel("Equity Curve")}
+      <div style={chartBox}>
+        <EquityChart trades={closed} />
+      </div>
+
+      {/* ── Trade excursions ─────────────────────────────────────────────────── */}
+      {sectionLabel("Trade Excursions · MFE (green) / MAE (red)")}
+      <div style={{ ...chartBox, marginBottom: 12 }}>
+        <ExcursionsChart trades={closed} />
+      </div>
+    </div>
+  );
+}
+
 // ─── Component: StrategyReport ────────────────────────────────────────────────
 function StrategyReport({ trades, strategyName }) {
   const [activeTab, setActiveTab] = useState("trades");
@@ -462,7 +780,7 @@ function StrategyReport({ trades, strategyName }) {
       </div>
 
       {/* Tabs */}
-      <div style={{ display: "flex", gap: 0, borderBottom: `1px solid ${THEME.bgSecondary}`, flexShrink: 0 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 0, borderBottom: `1px solid ${THEME.bgSecondary}`, flexShrink: 0 }}>
         {[{ id: "trades", label: "List of Trades" }, { id: "metrics", label: "Metrics" }].map((tab) => (
           <button
             key={tab.id}
@@ -472,16 +790,28 @@ function StrategyReport({ trades, strategyName }) {
             {tab.label}
           </button>
         ))}
+        {activeTab === "trades" && trades.length > 0 && (
+          <button
+            onClick={() => {
+              const blob = new Blob([JSON.stringify(trades, null, 2)], { type: "application/json" });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement("a");
+              a.href = url;
+              a.download = "trades.json";
+              a.click();
+              URL.revokeObjectURL(url);
+            }}
+            style={{ marginLeft: "auto", marginRight: 10, padding: "4px 10px", fontSize: 11, background: THEME.bgTertiary, color: THEME.textSecondary, border: `1px solid ${THEME.border}`, borderRadius: 4, cursor: "pointer", fontFamily: "inherit" }}
+          >
+            Export JSON
+          </button>
+        )}
       </div>
 
       {/* Tab content */}
       <div style={{ flex: 1, overflow: "hidden" }}>
         {activeTab === "trades" && <TradeTable trades={trades} />}
-        {activeTab === "metrics" && (
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: THEME.textSecondary, fontSize: 13 }}>
-            Metrics — coming soon
-          </div>
-        )}
+        {activeTab === "metrics" && <MetricsTab trades={trades} />}
       </div>
     </div>
   );
@@ -527,12 +857,11 @@ export default function App() {
   };
 
   // Chạy backtest mỗi khi candles hoặc params thay đổi
-  const { signals, trades } = useMemo(() => {
-    if (candles.length === 0) return { signals: [], trades: [] };
+  const trades = useMemo(() => {
+    if (candles.length === 0) return [];
     const strategy = STRATEGY_MAP[selectedStrategyId];
     const sigs = strategy.generateSignals(candles, strategyParams);
-    const trs = runBacktest(candles, sigs);
-    return { signals: sigs, trades: trs };
+    return runBacktest(candles, sigs);
   }, [candles, selectedStrategyId, strategyParams]);
 
   if (loading) return <Loading />;
@@ -554,7 +883,7 @@ export default function App() {
       <div style={{ flex: "0 0 60%", overflow: "hidden" }}>
         <CandlestickChart
           candles={candles}
-          signals={signals}
+          trades={trades}
           fetchMore={fetchMore}
           hasMoreRef={hasMoreRef}
           loadingMoreRef={loadingMoreRef}
