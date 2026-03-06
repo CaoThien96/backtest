@@ -244,6 +244,7 @@ function StrategyControls({ selectedId, params, onStrategyChange, onParamChange 
               value={params[key]}
               min={schema.min}
               max={schema.max}
+              step={schema.step ?? 1}
               onChange={(e) => onParamChange(key, Number(e.target.value))}
               style={{ width: 52, background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 12, textAlign: "center" }}
             />

@@ -2,13 +2,14 @@
 // Để thêm strategy mới: import + push vào STRATEGIES array.
 // Không cần sửa engine hay UI.
 
-import { PivotReversalStrategy } from "./pivotReversal";
+import { PivotReversalStrategy }    from "./pivotReversal";
+import { PivotReversalAtrStrategy } from "./pivotReversalAtr";
+import { PivotReversalRsiStrategy } from "./pivotReversalRsi";
 
 export const STRATEGIES = [
   PivotReversalStrategy,
-  // Thêm strategy khác ở đây, ví dụ:
-  // RSIStrategy,
-  // MACrossStrategy,
+  PivotReversalAtrStrategy,
+  PivotReversalRsiStrategy,
 ];
 
 export const STRATEGY_MAP = Object.fromEntries(
