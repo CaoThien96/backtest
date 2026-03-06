@@ -80,8 +80,8 @@ export const PivotReversalAtrStrategy = {
   name: "Pivot Reversal ATR Strategy",
 
   paramSchema: {
-    leftBars:  { type: "number", label: "Left Bars",  default: 4,   min: 1, max: 50  },
-    rightBars: { type: "number", label: "Right Bars", default: 2,   min: 1, max: 50  },
+    leftBars:  { type: "number", label: "Left Bars",  default: 3,   min: 1, max: 50  },
+    rightBars: { type: "number", label: "Right Bars", default: 3,   min: 1, max: 50  },
     atrLength: { type: "number", label: "ATR Length", default: 14,  min: 1, max: 100 },
     atrMult:   { type: "number", label: "ATR Mult",   default: 0.1, min: 0, max: 5, step: 0.1 },
   },

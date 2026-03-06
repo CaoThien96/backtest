@@ -1,0 +1,251 @@
+// ============================================================================
+// PRP - Pivot Reversal Point Strategy (Proposed reconstruction of QuantNomad's PRP)
+// ============================================================================
+// Based on reverse-engineering from:
+//   1. QuantNomad's base Pivot Reversal Strategy (open source)
+//   2. Screenshot parameters: (14, Standard, 15, 15, 0, 2, PSAR, 0.05, 0.01, 0.2, 2, 10, 3, Both)
+//   3. TradingView Pivot Point Strategy definition & rules
+//
+// Core Concept:
+//   Combines Pivot High/Low detection (breakout entries) with Standard Pivot Point
+//   levels (PP/S1/S2/R1/R2) as confirmation zones, plus PSAR trailing stop
+//   and ATR-based risk management.
+//
+// Parameters decoded from screenshot:
+//   14           → ATR period for risk management
+//   Standard     → Pivot Point calculation type
+//   15, 15       → leftBars, rightBars for pivot detection
+//   0            → Pivot Point source offset (0 = auto from HTF)
+//   2            → Number of S/R levels to display
+//   PSAR         → Trailing stop method
+//   0.05,0.01,0.2 → PSAR (start, increment, maximum)
+//   2            → ATR multiplier for stop loss
+//   10           → Take profit in ATR multiples (or percent)
+//   3            → Max pyramiding / risk factor
+//   Both         → Trade direction
+// ============================================================================
+
+//@version=5
+strategy("PRP - Pivot Reversal Point Strategy", 
+     overlay=true, 
+     default_qty_type=strategy.percent_of_equity, 
+     default_qty_value=50,
+     pyramiding=0,
+     initial_capital=10000,
+     commission_type=strategy.commission.percent,
+     commission_value=0.06)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+// --- Pivot Detection ---
+leftBars    = input.int(15, "Left Bars", minval=1, group="Pivot Detection")
+rightBars   = input.int(15, "Right Bars", minval=1, group="Pivot Detection")
+
+// --- Pivot Point Levels (Standard) ---
+ppType      = input.string("Standard", "Pivot Type", options=["Standard", "Fibonacci", "Woodie", "Camarilla"], group="Pivot Points")
+ppTimeframe = input.timeframe("D", "Pivot Timeframe", group="Pivot Points")
+ppLevels    = input.int(2, "Number of S/R Levels", minval=1, maxval=3, group="Pivot Points")
+
+// --- ATR Risk Management ---
+atrPeriod   = input.int(14, "ATR Period", minval=1, group="Risk Management")
+slMultiplier = input.float(2.0, "Stop Loss ATR Multiplier", step=0.1, group="Risk Management")
+tpMultiplier = input.float(10.0, "Take Profit ATR Multiplier", step=0.1, group="Risk Management")
+
+// --- PSAR Trailing Stop ---
+usePSAR     = input.bool(true, "Use PSAR Trailing Stop", group="PSAR")
+psarStart   = input.float(0.05, "PSAR Start", step=0.01, group="PSAR")
+psarInc     = input.float(0.01, "PSAR Increment", step=0.01, group="PSAR")
+psarMax     = input.float(0.2, "PSAR Maximum", step=0.01, group="PSAR")
+
+// --- Filters ---
+useZoneFilter = input.bool(true, "Use Pivot Zone Confirmation", group="Filters")
+zonePct       = input.float(0.5, "Zone Width (%)", step=0.1, group="Filters", tooltip="% distance from PP level to qualify as 'near zone'")
+
+// --- Direction ---
+tradeDir    = input.string("Both", "Trade Direction", options=["Long", "Short", "Both"], group="Direction")
+
+// ============================================================================
+// STANDARD PIVOT POINT CALCULATION (from Higher Timeframe)
+// ============================================================================
+
+// Get HTF OHLC
+[htfHigh, htfLow, htfClose] = request.security(syminfo.tickerid, ppTimeframe, [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+
+// Calculate Pivot Point levels based on type
+pp = switch ppType
+    "Standard"  => (htfHigh + htfLow + htfClose) / 3
+    "Woodie"    => (htfHigh + htfLow + 2 * close) / 4
+    "Fibonacci" => (htfHigh + htfLow + htfClose) / 3
+    "Camarilla" => (htfHigh + htfLow + htfClose) / 3
+    => (htfHigh + htfLow + htfClose) / 3
+
+ppRange = htfHigh - htfLow
+
+// Support levels
+s1 = switch ppType
+    "Standard"  => 2 * pp - htfHigh
+    "Woodie"    => 2 * pp - htfHigh
+    "Fibonacci" => pp - 0.382 * ppRange
+    "Camarilla" => htfClose - ppRange * 1.1 / 12
+    => 2 * pp - htfHigh
+
+s2 = switch ppType
+    "Standard"  => pp - ppRange
+    "Woodie"    => pp - ppRange
+    "Fibonacci" => pp - 0.618 * ppRange
+    "Camarilla" => htfClose - ppRange * 1.1 / 6
+    => pp - ppRange
+
+s3 = switch ppType
+    "Standard"  => pp - 2 * ppRange
+    "Woodie"    => htfLow - 2 * (htfHigh - pp)
+    "Fibonacci" => pp - 1.000 * ppRange
+    "Camarilla" => htfClose - ppRange * 1.1 / 4
+    => pp - 2 * ppRange
+
+// Resistance levels
+r1 = switch ppType
+    "Standard"  => 2 * pp - htfLow
+    "Woodie"    => 2 * pp - htfLow
+    "Fibonacci" => pp + 0.382 * ppRange
+    "Camarilla" => htfClose + ppRange * 1.1 / 12
+    => 2 * pp - htfLow
+
+r2 = switch ppType
+    "Standard"  => pp + ppRange
+    "Woodie"    => pp + ppRange
+    "Fibonacci" => pp + 0.618 * ppRange
+    "Camarilla" => htfClose + ppRange * 1.1 / 6
+    => pp + ppRange
+
+r3 = switch ppType
+    "Standard"  => pp + 2 * ppRange
+    "Woodie"    => htfHigh + 2 * (pp - htfLow)
+    "Fibonacci" => pp + 1.000 * ppRange
+    "Camarilla" => htfClose + ppRange * 1.1 / 4
+    => pp + 2 * ppRange
+
+// ============================================================================
+// PIVOT HIGH/LOW DETECTION (Core from base strategy)
+// ============================================================================
+
+swh = ta.pivothigh(leftBars, rightBars)
+swl = ta.pivotlow(leftBars, rightBars)
+
+swh_cond = not na(swh)
+swl_cond = not na(swl)
+
+// Track pivot prices (stepped lines in the chart)
+var float hprice = na
+var float lprice = na
+hprice := swh_cond ? swh : hprice
+lprice := swl_cond ? swl : lprice
+
+// ============================================================================
+// ZONE CONFIRMATION LOGIC
+// ============================================================================
+
+// Check if a pivot low formed near a support zone (PP, S1, S2)
+isNearSupport(price) =>
+    zoneWidth = price * zonePct / 100
+    (math.abs(price - pp) <= zoneWidth) or
+     (math.abs(price - s1) <= zoneWidth) or
+     (ppLevels >= 2 and math.abs(price - s2) <= zoneWidth) or
+     (ppLevels >= 3 and math.abs(price - s3) <= zoneWidth)
+
+// Check if a pivot high formed near a resistance zone (PP, R1, R2)
+isNearResistance(price) =>
+    zoneWidth = price * zonePct / 100
+    (math.abs(price - pp) <= zoneWidth) or
+     (math.abs(price - r1) <= zoneWidth) or
+     (ppLevels >= 2 and math.abs(price - r2) <= zoneWidth) or
+     (ppLevels >= 3 and math.abs(price - r3) <= zoneWidth)
+
+// ============================================================================
+// ENTRY SIGNAL LOGIC
+// ============================================================================
+
+// --- Long Entry (Pivot Reversal + Zone Confirmation) ---
+// When pivot low detected → arm long entry
+// Entry triggers when price breaks above the pivot high (breakout confirmation)
+// Zone filter: pivot low should be near a support level
+
+var bool longArmed = false
+var bool shortArmed = false
+
+// Pivot low detected → check zone → arm long
+longZoneOk = useZoneFilter ? isNearSupport(swl_cond ? swl : lprice) : true
+longArmed := swl_cond and longZoneOk ? true : (longArmed and high > hprice ? false : longArmed)
+
+// Pivot high detected → check zone → arm short  
+shortZoneOk = useZoneFilter ? isNearResistance(swh_cond ? swh : hprice) : true
+shortArmed := swh_cond and shortZoneOk ? true : (shortArmed and low < lprice ? false : shortArmed)
+
+// ============================================================================
+// ATR & PSAR CALCULATIONS
+// ============================================================================
+
+atrVal = ta.atr(atrPeriod)
+psarVal = ta.sar(psarStart, psarInc, psarMax)
+
+// ============================================================================
+// STRATEGY EXECUTION
+// ============================================================================
+
+// --- Long Entry ---
+canLong = tradeDir == "Both" or tradeDir == "Long"
+if longArmed and canLong and not na(hprice)
+    strategy.entry("PRP_Long", strategy.long, stop=hprice + syminfo.mintick, comment="PRP Long")
+
+// --- Short Entry ---
+canShort = tradeDir == "Both" or tradeDir == "Short"
+if shortArmed and canShort and not na(lprice)
+    strategy.entry("PRP_Short", strategy.short, stop=lprice - syminfo.mintick, comment="PRP Short")
+
+// ============================================================================
+// EXIT LOGIC (ATR-based SL/TP + PSAR Trailing)
+// ============================================================================
+
+// For active long positions
+if strategy.position_size > 0
+    slPrice = strategy.position_avg_price - atrVal * slMultiplier
+    tpPrice = strategy.position_avg_price + atrVal * tpMultiplier
+    
+    // PSAR trailing: use PSAR as trailing stop if it's above the fixed SL
+    effectiveSL = usePSAR and psarVal < close ? math.max(slPrice, psarVal) : slPrice
+    
+    strategy.exit("PRP_LX", "PRP_Long", stop=effectiveSL, limit=tpPrice, comment="Exit Long")
+
+// For active short positions
+if strategy.position_size < 0
+    slPrice = strategy.position_avg_price + atrVal * slMultiplier
+    tpPrice = strategy.position_avg_price - atrVal * tpMultiplier
+    
+    // PSAR trailing: use PSAR as trailing stop if it's below the fixed SL
+    effectiveSL = usePSAR and psarVal > close ? math.min(slPrice, psarVal) : slPrice
+    
+    strategy.exit("PRP_SX", "PRP_Short", stop=effectiveSL, limit=tpPrice, comment="Exit Short")
+
+// ============================================================================
+// PLOTTING
+// ============================================================================
+
+// Pivot Point levels
+plot(pp, "PP", color=color.gray, linewidth=1, style=plot.style_stepline)
+plot(s1, "S1", color=color.green, linewidth=1, style=plot.style_stepline)
+plot(r1, "R1", color=color.red, linewidth=1, style=plot.style_stepline)
+plot(ppLevels >= 2 ? s2 : na, "S2", color=color.new(color.green, 40), linewidth=1, style=plot.style_stepline)
+plot(ppLevels >= 2 ? r2 : na, "R2", color=color.new(color.red, 40), linewidth=1, style=plot.style_stepline)
+
+// Tracked pivot high/low levels (the stepped lines from screenshot)
+plot(hprice, "Pivot High Level", color=color.new(color.red, 0), linewidth=2, style=plot.style_stepline)
+plot(lprice, "Pivot Low Level", color=color.new(color.green, 0), linewidth=2, style=plot.style_stepline)
+
+// Pivot markers
+plotshape(swh_cond, "Pivot High", shape.triangledown, location.abovebar, color=color.red, size=size.small, offset=-rightBars)
+plotshape(swl_cond, "Pivot Low", shape.triangleup, location.belowbar, color=color.green, size=size.small, offset=-rightBars)
+
+// PSAR
+plot(usePSAR ? psarVal : na, "PSAR", color=close > psarVal ? color.green : color.red, style=plot.style_circles, linewidth=1)

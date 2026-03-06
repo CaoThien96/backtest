@@ -89,18 +89,68 @@ function buildTrade({
   };
 }
 
+// ── SL/TP Checker ─────────────────────────────────────────────────────────────
+// Scans bars [entryBarIndex+1, upToBarIndex) for stop loss or take profit hits.
+// Returns first hit { barIndex, exitPrice, exitSignal, timestamp } or null.
+// Gap protection: SL fills at min/max(bar.open, stopLoss) to handle overnight gaps.
+function checkSLTP(candles, position, upToBarIndex) {
+  const { type, entryBarIndex, stopLoss, takeProfit, exitFn } = position;
+  if (!stopLoss && !takeProfit && !exitFn) return null;
+  for (let i = entryBarIndex + 1; i < upToBarIndex; i++) {
+    const bar = candles[i];
+    // Dynamic exit (e.g. PSAR trailing stop) — takes priority over fixed SL/TP
+    if (exitFn) {
+      const hit = exitFn(bar, i);
+      if (hit) return { ...hit, barIndex: i };
+    }
+    // Fixed SL/TP fallback
+    if (type === "long") {
+      if (stopLoss   && bar.low  <= stopLoss)   return { barIndex: i, exitPrice: Math.min(bar.open, stopLoss),   exitSignal: "Stop Loss",   timestamp: bar.timestamp };
+      if (takeProfit && bar.high >= takeProfit) return { barIndex: i, exitPrice: Math.max(bar.open, takeProfit), exitSignal: "Take Profit", timestamp: bar.timestamp };
+    } else {
+      if (stopLoss   && bar.high >= stopLoss)   return { barIndex: i, exitPrice: Math.max(bar.open, stopLoss),   exitSignal: "Stop Loss",   timestamp: bar.timestamp };
+      if (takeProfit && bar.low  <= takeProfit) return { barIndex: i, exitPrice: Math.min(bar.open, takeProfit), exitSignal: "Take Profit", timestamp: bar.timestamp };
+    }
+  }
+  return null;
+}
+
 // ── Main Engine ───────────────────────────────────────────────────────────────
 
 export function runBacktest(candles, signals) {
   if (!candles.length || !signals.length) return [];
 
   const trades = [];
-  let position = null; // { type, entryBarIndex, entryPrice, entrySignal, entryTimestamp }
+  let position = null; // { type, entryBarIndex, entryPrice, entrySignal, entryTimestamp, stopLoss?, takeProfit? }
   let tradeNumber = 0;
   let cumulativePnL = 0;
 
   for (const signal of signals) {
     const bar = candles[signal.barIndex];
+
+    // Kiểm tra SL/TP trước khi xử lý signal tiếp theo
+    if (position) {
+      const hit = checkSLTP(candles, position, signal.barIndex);
+      if (hit) {
+        const trade = buildTrade({
+          tradeNumber: ++tradeNumber,
+          type: position.type,
+          entryBarIndex: position.entryBarIndex,
+          entryPrice: position.entryPrice,
+          entrySignal: position.entrySignal,
+          entryTimestamp: position.entryTimestamp,
+          exitBarIndex: hit.barIndex,
+          exitPrice: hit.exitPrice,
+          exitSignal: hit.exitSignal,
+          exitTimestamp: hit.timestamp,
+          candles,
+          cumulativePnL,
+        });
+        cumulativePnL = trade.cumulativePnL;
+        trades.push(trade);
+        position = null;
+      }
+    }
 
     // Nếu đang giữ position ngược chiều → đóng trước (reversal)
     if (position && position.type !== signal.type) {
@@ -136,32 +186,55 @@ export function runBacktest(candles, signals) {
         entryPrice: signal.entryPrice,
         entrySignal: signal.label,
         entryTimestamp: bar.timestamp, // ms
+        stopLoss:   signal.stopLoss   ?? null,
+        takeProfit: signal.takeProfit ?? null,
+        exitFn:     signal.exitFn     ?? null,
       };
     }
   }
 
   // Xử lý open trade cuối cùng (chưa đóng)
   if (position) {
-    const lastBar = candles[candles.length - 1];
-    const exitPrice = lastBar.close; // unrealized exit tại giá close cuối
+    // Kiểm tra SL/TP trong các bar còn lại
+    const hit = checkSLTP(candles, position, candles.length);
+    if (hit) {
+      const trade = buildTrade({
+        tradeNumber: ++tradeNumber,
+        type: position.type,
+        entryBarIndex: position.entryBarIndex,
+        entryPrice: position.entryPrice,
+        entrySignal: position.entrySignal,
+        entryTimestamp: position.entryTimestamp,
+        exitBarIndex: hit.barIndex,
+        exitPrice: hit.exitPrice,
+        exitSignal: hit.exitSignal,
+        exitTimestamp: hit.timestamp,
+        candles,
+        cumulativePnL,
+      });
+      trades.push(trade);
+    } else {
+      const lastBar = candles[candles.length - 1];
+      const exitPrice = lastBar.close; // unrealized exit tại giá close cuối
 
-    const trade = buildTrade({
-      tradeNumber: ++tradeNumber,
-      type: position.type,
-      entryBarIndex: position.entryBarIndex,
-      entryPrice: position.entryPrice,
-      entrySignal: position.entrySignal,
-      entryTimestamp: position.entryTimestamp,
-      exitBarIndex: candles.length - 1,
-      exitPrice,
-      exitSignal: null,
-      exitTimestamp: null,
-      candles,
-      cumulativePnL,
-      isOpen: true,
-    });
+      const trade = buildTrade({
+        tradeNumber: ++tradeNumber,
+        type: position.type,
+        entryBarIndex: position.entryBarIndex,
+        entryPrice: position.entryPrice,
+        entrySignal: position.entrySignal,
+        entryTimestamp: position.entryTimestamp,
+        exitBarIndex: candles.length - 1,
+        exitPrice,
+        exitSignal: null,
+        exitTimestamp: null,
+        candles,
+        cumulativePnL,
+        isOpen: true,
+      });
 
-    trades.push(trade);
+      trades.push(trade);
+    }
   }
 
   // Tính cumulativePnLPercent dùng positionValue của trade đầu tiên làm initial capital

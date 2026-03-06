@@ -66,8 +66,8 @@ export const PivotReversalStrategy = {
 
   // Schema → UI form tự động sinh ra từ đây
   paramSchema: {
-    leftBars:  { type: "number", label: "Left Bars",  default: 4, min: 1, max: 50 },
-    rightBars: { type: "number", label: "Right Bars", default: 2, min: 1, max: 50 },
+    leftBars:  { type: "number", label: "Left Bars",  default: 3, min: 1, max: 50 },
+    rightBars: { type: "number", label: "Right Bars", default: 3, min: 1, max: 50 },
   },
 
   // Pure function: candles[] + params → signals[]

@@ -5,11 +5,15 @@
 import { PivotReversalStrategy }    from "./pivotReversal";
 import { PivotReversalAtrStrategy } from "./pivotReversalAtr";
 import { PivotReversalRsiStrategy } from "./pivotReversalRsi";
+import { MomentumZigzagStrategy }   from "./momentumZigzag";
+import { PrpPivotPsarStrategy }     from "./prpPivotPsar";
 
 export const STRATEGIES = [
   PivotReversalStrategy,
   PivotReversalAtrStrategy,
   PivotReversalRsiStrategy,
+  MomentumZigzagStrategy,
+  PrpPivotPsarStrategy,
 ];
 
 export const STRATEGY_MAP = Object.fromEntries(

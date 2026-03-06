@@ -249,6 +249,15 @@ function StrategyControls({ selectedId, params, onStrategyChange, onParamChange 
               style={{ width: 52, background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 12, textAlign: "center" }}
             />
           )}
+          {schema.type === "select" && (
+            <select
+              value={params[key]}
+              onChange={(e) => onParamChange(key, e.target.value)}
+              style={{ background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 12, cursor: "pointer" }}
+            >
+              {schema.options.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
+            </select>
+          )}
         </label>
       ))}
     </div>
@@ -895,12 +904,20 @@ function StrategyReport({ trades, strategyName }) {
   const closedTrades = trades.filter((t) => !t.isOpen).length;
   const totalPnL = trades.reduce((sum, t) => (!t.isOpen ? sum + t.netPnL : sum), 0);
 
+  const firstTs = trades.length > 0 ? trades[0].entryTimestamp : null;
+  const startDateStr = firstTs
+    ? new Date(firstTs).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })
+    : null;
+  const totalDays = firstTs ? Math.floor((Date.now() - firstTs) / 86400000) : null;
+
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", background: THEME.bgPrimary, borderTop: `1px solid ${THEME.border}` }}>
       {/* Panel header */}
       <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 14px", borderBottom: `1px solid ${THEME.bgSecondary}`, flexShrink: 0 }}>
         <span style={{ color: THEME.textPrimary, fontWeight: 600, fontSize: 13 }}>{strategyName}</span>
         <div style={{ marginLeft: "auto", display: "flex", gap: 16, fontSize: 11, color: THEME.textSecondary }}>
+          {startDateStr && <span>From: {startDateStr}</span>}
+          {totalDays !== null && <span>{totalDays} days</span>}
           <span>{closedTrades} trades</span>
           <span>Win rate: {closedTrades ? Math.round((winTrades / closedTrades) * 100) : 0}%</span>
           <span style={{ color: totalPnL >= 0 ? THEME.green : THEME.red, fontWeight: 600 }}>
