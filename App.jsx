@@ -61,13 +61,42 @@ function formatPnL(val, percent) {
   return `${sign}${formatPrice(val)} (${sign}${percent?.toFixed(2)}%)`;
 }
 
+// ─── Hook: throttle a value (max 1 update per `delay` ms) ────────────────────
+function useThrottle(value, delay) {
+  const [throttled, setThrottled] = useState(value);
+  const lastUpdated = useRef(0);
+  useEffect(() => {
+    const now = Date.now();
+    const elapsed = now - lastUpdated.current;
+    if (elapsed >= delay) {
+      lastUpdated.current = now;
+      setThrottled(value);
+    } else {
+      const timer = setTimeout(() => {
+        lastUpdated.current = Date.now();
+        setThrottled(value);
+      }, delay - elapsed);
+      return () => clearTimeout(timer);
+    }
+  }, [value, delay]);
+  return throttled;
+}
+
 // ─── Hook: candle data + load more ───────────────────────────────────────────
 function useCandleData(symbol = "BTCUSDT", interval = "15") {
   const [candles, setCandles] = useState([]);
+  const [liveCandle, setLiveCandle] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const loadingMoreRef = useRef(false);
   const hasMoreRef = useRef(true);
+
+  // ── WebSocket refs ──────────────────────────────────────────────────────────
+  const wsRef = useRef(null);
+  const pingRef = useRef(null);
+  const reconnectRef = useRef(null);
+  const backoffRef = useRef(1000); // doubles on each failure, max 30s
+  const mountedRef = useRef(true);
 
   const fetchInitial = useCallback(async () => {
     setLoading(true);
@@ -116,7 +145,76 @@ function useCandleData(symbol = "BTCUSDT", interval = "15") {
 
   useEffect(() => { fetchInitial(); }, [fetchInitial]);
 
-  return { candles, loading, error, refetch: fetchInitial, fetchMore, hasMoreRef, loadingMoreRef };
+  // ── WebSocket: connect + subscribe + heartbeat + reconnect ──────────────────
+  const connectWs = useCallback(() => {
+    if (!mountedRef.current) return;
+    clearTimeout(reconnectRef.current);
+
+    const ws = new WebSocket("wss://stream.bybit.com/v5/public/linear");
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ op: "subscribe", args: [`kline.${interval}.${symbol}`] }));
+      backoffRef.current = 1000; // reset backoff on successful connect
+      pingRef.current = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ op: "ping" }));
+      }, 20000);
+    };
+
+    ws.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      if (!msg.topic?.startsWith("kline.") || !msg.data?.length) return;
+      const d = msg.data[0];
+      const ts = parseInt(d.start);
+      const candle = {
+        timestamp: ts,
+        time: Math.floor(ts / 1000),
+        open: parseFloat(d.open),
+        high: parseFloat(d.high),
+        low: parseFloat(d.low),
+        close: parseFloat(d.close),
+        volume: parseFloat(d.volume),
+      };
+
+      if (d.confirm) {
+        // Bar just closed → move into confirmed candles
+        setCandles((prev) => {
+          if (!prev.length) return prev;
+          const last = prev[prev.length - 1];
+          if (candle.time === last.time) return [...prev.slice(0, -1), candle];
+          if (candle.time > last.time) return [...prev, candle];
+          return prev;
+        });
+        setLiveCandle(null);
+      } else {
+        // Bar still forming → update live candle only
+        setLiveCandle(candle);
+      }
+    };
+
+    ws.onclose = () => {
+      clearInterval(pingRef.current);
+      if (!mountedRef.current) return;
+      const delay = backoffRef.current;
+      backoffRef.current = Math.min(backoffRef.current * 2, 30000);
+      reconnectRef.current = setTimeout(connectWs, delay);
+    };
+
+    ws.onerror = () => ws.close(); // triggers onclose → reconnect
+  }, [symbol, interval]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    connectWs();
+    return () => {
+      mountedRef.current = false;
+      clearInterval(pingRef.current);
+      clearTimeout(reconnectRef.current);
+      wsRef.current?.close();
+    };
+  }, [connectWs]);
+
+  return { candles, liveCandle, loading, error, refetch: fetchInitial, fetchMore, hasMoreRef, loadingMoreRef };
 }
 
 // ─── Component: StrategyControls ─────────────────────────────────────────────
@@ -157,7 +255,7 @@ function StrategyControls({ selectedId, params, onStrategyChange, onParamChange 
 }
 
 // ─── Component: CandlestickChart ─────────────────────────────────────────────
-function CandlestickChart({ candles, trades, fetchMore, hasMoreRef, loadingMoreRef }) {
+function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, loadingMoreRef }) {
   const containerRef = useRef(null);
   const chartRef = useRef(null);
   const candleSeriesRef = useRef(null);
@@ -167,8 +265,10 @@ function CandlestickChart({ candles, trades, fetchMore, hasMoreRef, loadingMoreR
 
   const candlesRef = useRef(candles);
   const fetchMoreRef = useRef(fetchMore);
+  const liveCandleRef = useRef(liveCandle);
   useEffect(() => { candlesRef.current = candles; }, [candles]);
   useEffect(() => { fetchMoreRef.current = fetchMore; }, [fetchMore]);
+  useEffect(() => { liveCandleRef.current = liveCandle; }, [liveCandle]);
 
   const [hoveredBar, setHoveredBar] = useState(null);
   const [activeTimeframe, setActiveTimeframe] = useState("5D");
@@ -244,9 +344,16 @@ function CandlestickChart({ candles, trades, fetchMore, hasMoreRef, loadingMoreR
     cs.setData(candles.map((c) => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close })));
     vs.setData(candles.map((c) => ({ time: c.time, value: c.volume, color: c.close >= c.open ? `${THEME.green}55` : `${THEME.red}55` })));
 
+    // Restore live bar if present (setData wipes it)
+    const live = liveCandleRef.current;
+    if (live) {
+      cs.update({ time: live.time, open: live.open, high: live.high, low: live.low, close: live.close });
+      vs.update({ time: live.time, value: live.volume, color: live.close >= live.open ? `${THEME.green}55` : `${THEME.red}55` });
+    }
+
     if (priceLineRef.current) cs.removePriceLine(priceLineRef.current);
     priceLineRef.current = cs.createPriceLine({
-      price: candles[candles.length - 1].close,
+      price: (live ?? candles[candles.length - 1]).close,
       color: THEME.textSecondary,
       lineWidth: 1,
       lineStyle: LineStyle.Dashed,
@@ -258,6 +365,28 @@ function CandlestickChart({ candles, trades, fetchMore, hasMoreRef, loadingMoreR
       isFirstDataRef.current = false;
     }
   }, [candles]);
+
+  // ── Live candle incremental update (WS tick) ─────────────────────────────────
+  useEffect(() => {
+    const cs = candleSeriesRef.current;
+    const vs = volSeriesRef.current;
+    if (!cs || !vs || !liveCandle) return;
+
+    cs.update({ time: liveCandle.time, open: liveCandle.open, high: liveCandle.high, low: liveCandle.low, close: liveCandle.close });
+    vs.update({ time: liveCandle.time, value: liveCandle.volume, color: liveCandle.close >= liveCandle.open ? `${THEME.green}55` : `${THEME.red}55` });
+
+    // Keep price line on latest live price
+    if (priceLineRef.current) {
+      cs.removePriceLine(priceLineRef.current);
+      priceLineRef.current = cs.createPriceLine({
+        price: liveCandle.close,
+        color: THEME.textSecondary,
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+      });
+    }
+  }, [liveCandle]);
 
   // ── Cập nhật signal markers ─────────────────────────────────────────────────
   // Derive markers from trades (not raw signals) to avoid spurious markers
@@ -839,7 +968,7 @@ function ErrorState({ message, onRetry }) {
 
 // ─── App root ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const { candles, loading, error, refetch, fetchMore, hasMoreRef, loadingMoreRef } =
+  const { candles, liveCandle, loading, error, refetch, fetchMore, hasMoreRef, loadingMoreRef } =
     useCandleData("BTCUSDT", "15");
 
   // Strategy state
@@ -856,13 +985,17 @@ export default function App() {
     setStrategyParams((prev) => ({ ...prev, [key]: val }));
   };
 
-  // Chạy backtest mỗi khi candles hoặc params thay đổi
+  // liveCandle throttled 30s — tránh backtest recompute mỗi WS tick
+  const liveCandleForBacktest = useThrottle(liveCandle, 30000);
+
+  // Chạy backtest mỗi khi confirmed candles hoặc throttled live candle thay đổi
   const trades = useMemo(() => {
-    if (candles.length === 0) return [];
+    const allCandles = liveCandleForBacktest ? [...candles, liveCandleForBacktest] : candles;
+    if (allCandles.length === 0) return [];
     const strategy = STRATEGY_MAP[selectedStrategyId];
-    const sigs = strategy.generateSignals(candles, strategyParams);
-    return runBacktest(candles, sigs);
-  }, [candles, selectedStrategyId, strategyParams]);
+    const sigs = strategy.generateSignals(allCandles, strategyParams);
+    return runBacktest(allCandles, sigs);
+  }, [candles, liveCandleForBacktest, selectedStrategyId, strategyParams]);
 
   if (loading) return <Loading />;
   if (error) return <ErrorState message={error} onRetry={refetch} />;
@@ -884,6 +1017,7 @@ export default function App() {
         <CandlestickChart
           candles={candles}
           trades={trades}
+          liveCandle={liveCandle}
           fetchMore={fetchMore}
           hasMoreRef={hasMoreRef}
           loadingMoreRef={loadingMoreRef}
