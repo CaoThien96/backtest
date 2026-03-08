@@ -15,6 +15,14 @@ const TIMEFRAMES = [
   { label: "All", days: null },
 ];
 
+const INTERVALS = [
+  { label: "5m",  value: "5"  },
+  { label: "15m", value: "15" },
+  { label: "30m", value: "30" },
+  { label: "1h",  value: "60" },
+  { label: "1d",  value: "D"  },
+];
+
 const THEME = {
   bgPrimary: "#131722",
   bgSecondary: "#1e222d",
@@ -99,6 +107,8 @@ function useCandleData(symbol = "BTCUSDT", interval = "15") {
   const mountedRef = useRef(true);
 
   const fetchInitial = useCallback(async () => {
+    setCandles([]);
+    setLiveCandle(null);
     setLoading(true);
     setError(null);
     loadingMoreRef.current = false;
@@ -218,7 +228,7 @@ function useCandleData(symbol = "BTCUSDT", interval = "15") {
 }
 
 // ─── Component: StrategyControls ─────────────────────────────────────────────
-function StrategyControls({ selectedId, params, onStrategyChange, onParamChange }) {
+function StrategyControls({ selectedId, params, onStrategyChange, onParamChange, positionSize, onPositionSizeChange, trailEnabled, onTrailEnabledChange, trailPct, onTrailPctChange, minFePct, onMinFePctChange }) {
   const strategy = STRATEGY_MAP[selectedId];
 
   return (
@@ -233,6 +243,61 @@ function StrategyControls({ selectedId, params, onStrategyChange, onParamChange 
           <option key={s.id} value={s.id}>{s.name}</option>
         ))}
       </select>
+
+      {/* Position size */}
+      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: THEME.textSecondary }}>
+        Position (USDT)
+        <input
+          type="number"
+          value={positionSize}
+          min={1}
+          step={1000}
+          onChange={(e) => onPositionSizeChange(Number(e.target.value))}
+          style={{ width: 72, background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 12, textAlign: "center" }}
+        />
+      </label>
+
+      {/* Divider */}
+      <div style={{ width: 1, height: 14, background: THEME.border }} />
+
+      {/* Trailing Stop */}
+      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: THEME.textSecondary, cursor: "pointer" }}>
+        <input
+          type="checkbox"
+          checked={trailEnabled}
+          onChange={(e) => onTrailEnabledChange(e.target.checked)}
+          style={{ accentColor: THEME.blue, cursor: "pointer" }}
+        />
+        Trail %
+      </label>
+      {trailEnabled && (
+        <>
+          <input
+            type="number"
+            value={trailPct}
+            min={0.1}
+            max={99}
+            step={0.1}
+            onChange={(e) => onTrailPctChange(Math.max(0.1, Math.min(99, Number(e.target.value))))}
+            style={{ width: 44, background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 12, textAlign: "center" }}
+          />
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: THEME.textSecondary }}>
+            Min FE%
+            <input
+              type="number"
+              value={minFePct}
+              min={0.1}
+              max={50}
+              step={0.1}
+              onChange={(e) => onMinFePctChange(Math.max(0.1, Number(e.target.value)))}
+              style={{ width: 44, background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 12, textAlign: "center" }}
+            />
+          </label>
+        </>
+      )}
+
+      {/* Divider */}
+      <div style={{ width: 1, height: 14, background: THEME.border }} />
 
       {/* Auto-generated param inputs */}
       {Object.entries(strategy.paramSchema).map(([key, schema]) => (
@@ -265,7 +330,7 @@ function StrategyControls({ selectedId, params, onStrategyChange, onParamChange 
 }
 
 // ─── Component: CandlestickChart ─────────────────────────────────────────────
-function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, loadingMoreRef }) {
+function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, loadingMoreRef, selectedInterval, onIntervalChange }) {
   const containerRef = useRef(null);
   const chartRef = useRef(null);
   const candleSeriesRef = useRef(null);
@@ -355,15 +420,17 @@ function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, 
     vs.setData(candles.map((c) => ({ time: c.time, value: c.volume, color: c.close >= c.open ? `${THEME.green}55` : `${THEME.red}55` })));
 
     // Restore live bar if present (setData wipes it)
+    // Guard: skip if live candle is stale from a previous interval
     const live = liveCandleRef.current;
-    if (live) {
+    const liveValid = live && live.time >= candles[candles.length - 1].time;
+    if (liveValid) {
       cs.update({ time: live.time, open: live.open, high: live.high, low: live.low, close: live.close });
       vs.update({ time: live.time, value: live.volume, color: live.close >= live.open ? `${THEME.green}55` : `${THEME.red}55` });
     }
 
     if (priceLineRef.current) cs.removePriceLine(priceLineRef.current);
     priceLineRef.current = cs.createPriceLine({
-      price: (live ?? candles[candles.length - 1]).close,
+      price: (liveValid ? live : candles[candles.length - 1]).close,
       color: THEME.textSecondary,
       lineWidth: 1,
       lineStyle: LineStyle.Dashed,
@@ -381,6 +448,10 @@ function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, 
     const cs = candleSeriesRef.current;
     const vs = volSeriesRef.current;
     if (!cs || !vs || !liveCandle) return;
+
+    // Guard: skip stale WS tick from previous interval (its time < last confirmed bar)
+    const confirmed = candlesRef.current;
+    if (confirmed.length > 0 && liveCandle.time < confirmed[confirmed.length - 1].time) return;
 
     cs.update({ time: liveCandle.time, open: liveCandle.open, high: liveCandle.high, low: liveCandle.low, close: liveCandle.close });
     vs.update({ time: liveCandle.time, value: liveCandle.volume, color: liveCandle.close >= liveCandle.open ? `${THEME.green}55` : `${THEME.red}55` });
@@ -464,8 +535,17 @@ function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, 
       {/* Chart */}
       <div ref={containerRef} style={{ flex: 1, position: "relative" }} />
 
-      {/* Timeframe selector */}
-      <div style={{ display: "flex", gap: 2, padding: "6px 12px", borderTop: `1px solid ${THEME.bgSecondary}`, flexShrink: 0 }}>
+      {/* Bottom bar: interval selector + zoom buttons */}
+      <div style={{ display: "flex", alignItems: "center", gap: 2, padding: "6px 12px", borderTop: `1px solid ${THEME.bgSecondary}`, flexShrink: 0 }}>
+        {INTERVALS.map((iv) => {
+          const active = selectedInterval === iv.value;
+          return (
+            <button key={iv.value} onClick={() => onIntervalChange(iv.value)} style={{ padding: "3px 9px", fontSize: 12, fontFamily: "inherit", background: active ? THEME.blue : "transparent", color: active ? "#fff" : THEME.textSecondary, border: "none", borderRadius: 4, cursor: "pointer", fontWeight: active ? 600 : 400 }}>
+              {iv.label}
+            </button>
+          );
+        })}
+        <div style={{ width: 1, height: 14, background: THEME.border, margin: "0 6px" }} />
         {TIMEFRAMES.map((tf) => {
           const active = activeTimeframe === tf.label;
           return (
@@ -984,14 +1064,73 @@ function ErrorState({ message, onRetry }) {
   );
 }
 
+// ─── Trailing Stop Simulator (bar-by-bar, Bybit-standard) ────────────────────
+// Bybit formula:
+//   Long:  trailStopPrice = highestPrice × (1 - trailPct/100)
+//   Short: trailStopPrice = lowestPrice  × (1 + trailPct/100)
+// Activation: trail only arms after price moves minFePct% favorably from entry.
+// Returns simulated exit P&L in USDT, or null if trail never triggered.
+function simulateTrailingStop(trade, allCandles, trailPct, minFePct) {
+  const { entryBarIndex, exitBarIndex, entryPrice, positionSize } = trade;
+  if (entryBarIndex == null || exitBarIndex == null) return null;
+
+  const isLong          = trade.type === "Long";
+  const trailMult       = trailPct / 100;
+  // Activation price: price must reach this level before trail arms
+  const activationPrice = isLong
+    ? entryPrice * (1 + minFePct / 100)
+    : entryPrice * (1 - minFePct / 100);
+
+  let peakPrice   = entryPrice; // highest (long) or lowest (short) price seen
+  let trailActive = false;
+
+  for (let i = entryBarIndex; i < exitBarIndex; i++) {
+    const bar = allCandles[i];
+    if (!bar) break;
+
+    // 1. Update peak price
+    if (isLong) {
+      peakPrice = Math.max(peakPrice, bar.high);
+      if (!trailActive && peakPrice >= activationPrice) trailActive = true;
+    } else {
+      peakPrice = Math.min(peakPrice, bar.low);
+      if (!trailActive && peakPrice <= activationPrice) trailActive = true;
+    }
+
+    // 2. Check if trail stop triggered (with gap protection)
+    if (trailActive) {
+      if (isLong) {
+        const trailStopPrice = peakPrice * (1 - trailMult);
+        if (bar.low <= trailStopPrice) {
+          const exitPrice = Math.min(bar.open, trailStopPrice); // gap protection
+          return (exitPrice - entryPrice) * positionSize;
+        }
+      } else {
+        const trailStopPrice = peakPrice * (1 + trailMult);
+        if (bar.high >= trailStopPrice) {
+          const exitPrice = Math.max(bar.open, trailStopPrice); // gap protection
+          return (entryPrice - exitPrice) * positionSize;
+        }
+      }
+    }
+  }
+
+  return null; // trail never triggered — keep actual netPnL
+}
+
 // ─── App root ─────────────────────────────────────────────────────────────────
 export default function App() {
+  const [selectedInterval, setSelectedInterval] = useState("15");
   const { candles, liveCandle, loading, error, refetch, fetchMore, hasMoreRef, loadingMoreRef } =
-    useCandleData("BTCUSDT", "15");
+    useCandleData("BTCUSDT", selectedInterval);
 
   // Strategy state
   const [selectedStrategyId, setSelectedStrategyId] = useState(STRATEGIES[0].id);
   const [strategyParams, setStrategyParams] = useState(getDefaultParams(STRATEGIES[0]));
+  const [positionSize, setPositionSize] = useState(10000);
+  const [trailEnabled, setTrailEnabled] = useState(false);
+  const [trailPct, setTrailPct]         = useState(10);
+  const [minFePct, setMinFePct]         = useState(1); // min FE% of position to activate trail
 
   // Cập nhật params khi đổi strategy
   const handleStrategyChange = (id) => {
@@ -1012,8 +1151,27 @@ export default function App() {
     if (allCandles.length === 0) return [];
     const strategy = STRATEGY_MAP[selectedStrategyId];
     const sigs = strategy.generateSignals(allCandles, strategyParams);
-    return runBacktest(allCandles, sigs);
-  }, [candles, liveCandleForBacktest, selectedStrategyId, strategyParams]);
+    return runBacktest(allCandles, sigs, { positionSizeUSDT: positionSize });
+  }, [candles, liveCandleForBacktest, selectedStrategyId, strategyParams, positionSize]);
+
+  const displayTrades = useMemo(() => {
+    if (!trailEnabled || trades.length === 0) return trades;
+    const allCandles = liveCandleForBacktest ? [...candles, liveCandleForBacktest] : candles;
+    const initialCapital = trades[0].positionValue;
+    let cumPnL = 0;
+    return trades.map((t) => {
+      const trailPnL = simulateTrailingStop(t, allCandles, trailPct, minFePct);
+      const simPnL   = trailPnL !== null ? trailPnL : t.netPnL;
+      cumPnL += simPnL;
+      return {
+        ...t,
+        netPnL:               simPnL,
+        netPnLPercent:        (simPnL / t.positionValue) * 100,
+        cumulativePnL:        cumPnL,
+        cumulativePnLPercent: (cumPnL / initialCapital) * 100,
+      };
+    });
+  }, [trades, trailEnabled, trailPct, minFePct, candles, liveCandleForBacktest]);
 
   if (loading) return <Loading />;
   if (error) return <ErrorState message={error} onRetry={refetch} />;
@@ -1028,6 +1186,14 @@ export default function App() {
         params={strategyParams}
         onStrategyChange={handleStrategyChange}
         onParamChange={handleParamChange}
+        positionSize={positionSize}
+        onPositionSizeChange={setPositionSize}
+        trailEnabled={trailEnabled}
+        onTrailEnabledChange={setTrailEnabled}
+        trailPct={trailPct}
+        onTrailPctChange={setTrailPct}
+        minFePct={minFePct}
+        onMinFePctChange={setMinFePct}
       />
 
       {/* Chart — 60% height */}
@@ -1039,12 +1205,14 @@ export default function App() {
           fetchMore={fetchMore}
           hasMoreRef={hasMoreRef}
           loadingMoreRef={loadingMoreRef}
+          selectedInterval={selectedInterval}
+          onIntervalChange={setSelectedInterval}
         />
       </div>
 
       {/* Strategy report — 40% height */}
       <div style={{ flex: "0 0 40%", overflow: "hidden" }}>
-        <StrategyReport trades={trades} strategyName={strategy.name} />
+        <StrategyReport trades={displayTrades} strategyName={strategy.name} />
       </div>
     </div>
   );

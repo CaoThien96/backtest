@@ -49,11 +49,12 @@ function buildTrade({
   candles,
   cumulativePnL,
   isOpen = false,
+  positionSizeUSDT = 10000,
 }) {
-  const positionSize = 1;
-  const positionValue = entryPrice * positionSize;
+  const positionValue = positionSizeUSDT;
+  const positionSize  = positionSizeUSDT / entryPrice; // # of contracts
 
-  const netPnL = calcNetPnL(type, entryPrice, exitPrice);
+  const netPnL = calcNetPnL(type, entryPrice, exitPrice) * positionSize;
   const netPnLPercent = (netPnL / positionValue) * 100;
 
   const { mfe, mae } = calcExcursions(
@@ -63,12 +64,16 @@ function buildTrade({
     entryPrice,
     type
   );
+  const mfeUSDT = mfe * positionSize;
+  const maeUSDT = mae * positionSize;
 
   const cumPnL = cumulativePnL + netPnL;
 
   return {
     tradeNumber,
     type: type === "long" ? "Long" : "Short",
+    entryBarIndex,
+    exitBarIndex,
     entryTimestamp,   // ms — để display
     entryPrice,
     entrySignal,
@@ -80,10 +85,10 @@ function buildTrade({
     positionValue,
     netPnL,
     netPnLPercent,
-    favorableExcursion: mfe,
-    favorableExcursionPercent: (mfe / positionValue) * 100,
-    adverseExcursion: mae,
-    adverseExcursionPercent: (mae / positionValue) * 100,
+    favorableExcursion: mfeUSDT,
+    favorableExcursionPercent: (mfeUSDT / positionValue) * 100,
+    adverseExcursion: maeUSDT,
+    adverseExcursionPercent: (maeUSDT / positionValue) * 100,
     cumulativePnL: cumPnL,
     // cumulativePnLPercent dùng positionValue của trade đầu tiên làm base (tính sau)
   };
@@ -117,7 +122,7 @@ function checkSLTP(candles, position, upToBarIndex) {
 
 // ── Main Engine ───────────────────────────────────────────────────────────────
 
-export function runBacktest(candles, signals) {
+export function runBacktest(candles, signals, { positionSizeUSDT = 10000 } = {}) {
   if (!candles.length || !signals.length) return [];
 
   const trades = [];
@@ -145,6 +150,7 @@ export function runBacktest(candles, signals) {
           exitTimestamp: hit.timestamp,
           candles,
           cumulativePnL,
+          positionSizeUSDT,
         });
         cumulativePnL = trade.cumulativePnL;
         trades.push(trade);
@@ -170,6 +176,7 @@ export function runBacktest(candles, signals) {
         exitTimestamp: exitBar.timestamp,
         candles,
         cumulativePnL,
+        positionSizeUSDT,
       });
 
       cumulativePnL = trade.cumulativePnL;
@@ -211,6 +218,7 @@ export function runBacktest(candles, signals) {
         exitTimestamp: hit.timestamp,
         candles,
         cumulativePnL,
+        positionSizeUSDT,
       });
       trades.push(trade);
     } else {
@@ -231,6 +239,7 @@ export function runBacktest(candles, signals) {
         candles,
         cumulativePnL,
         isOpen: true,
+        positionSizeUSDT,
       });
 
       trades.push(trade);
