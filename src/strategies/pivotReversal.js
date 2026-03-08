@@ -15,7 +15,10 @@
 //   PivRevLE: mua khi giá VƯỢT LÊN TRÊN pivot high (breakout mua)
 //   PivRevSE: bán khi giá XUYÊN XUỐNG DƯỚI pivot low (breakdown bán)
 
-const BTCUSDT_MINTICK = 0.1; // Bybit BTCUSDT Perp mintick = $0.1
+const BTCUSDT_MINTICK = 0; // Bybit BTCUSDT Perp mintick = $0.1
+const PRICE_EPS = 1e-9; // float-safe: bar.high >= stopLevel can fail when stopLevel = 67449.3+0.1
+
+// Debug: set window.__PIVOT_DEBUG_TS__ = 1741389300 (0h15 8 Mar 2026 UTC) then refetch/change interval to log that bar
 
 // ── Pivot High Detection ──────────────────────────────────────────────────────
 // Tại bar i, kiểm tra bar (i - rightBars) có là pivot high không:
@@ -89,11 +92,12 @@ export const PivotReversalStrategy = {
       // ── STEP 1: Execute pending stop orders (từ bar trước) ──────────────────
       // Mô phỏng TradingView: order đặt tại bar N → execute tại bar N+1
       if (i > 0) {
-        // Long stop: bar.high >= hprice + TICK → entry triggers
-        if (le && hprice > 0 && bar.high >= hprice + TICK) {
+        // Long stop: bar.high >= hprice + TICK → entry triggers (float-safe)
+        const longStop = hprice + TICK;
+        if (le && hprice > 0 && bar.high >= longStop - PRICE_EPS) {
           // Fill price: nếu bar mở trên stop → fill tại open (gap up)
           // Ngược lại → fill tại stop price
-          const stopPrice = hprice + TICK;
+          const stopPrice = longStop;
           const entryPrice = bar.open > stopPrice ? bar.open : stopPrice;
           signals.push({
             barIndex: i,
@@ -107,9 +111,10 @@ export const PivotReversalStrategy = {
           le = false; // disarm sau khi stop trigger
         }
 
-        // Short stop: bar.low <= lprice - TICK → entry triggers
-        if (se && lprice > 0 && bar.low <= lprice - TICK) {
-          const stopPrice = lprice - TICK;
+        // Short stop: bar.low <= lprice - TICK → entry triggers (float-safe)
+        const shortStop = lprice - TICK;
+        if (se && lprice > 0 && bar.low <= shortStop + PRICE_EPS) {
+          const stopPrice = shortStop;
           const entryPrice = bar.open < stopPrice ? bar.open : stopPrice;
           signals.push({
             barIndex: i,

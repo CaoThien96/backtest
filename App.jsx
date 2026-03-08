@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { createChart, LineStyle } from "lightweight-charts";
 import { STRATEGIES, STRATEGY_MAP, getDefaultParams } from "./src/strategies/index.js";
 import { runBacktest } from "./src/backtest/engine.js";
+import { getProvider, PROVIDERS, DEFAULT_PROVIDER_ID } from "./src/data/providers/index.js";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const TIMEFRAMES = [
@@ -38,18 +39,6 @@ const THEME = {
 const PREFETCH_THRESHOLD = 50;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-function normalizeList(list) {
-  return [...list].reverse().map((c) => ({
-    timestamp: parseInt(c[0]),
-    time: Math.floor(parseInt(c[0]) / 1000),
-    open: parseFloat(c[1]),
-    high: parseFloat(c[2]),
-    low: parseFloat(c[3]),
-    close: parseFloat(c[4]),
-    volume: parseFloat(c[5]),
-  }));
-}
-
 function formatDateTime(timestampMs) {
   if (!timestampMs) return "—";
   return new Date(timestampMs).toLocaleString("en-US", {
@@ -90,8 +79,9 @@ function useThrottle(value, delay) {
   return throttled;
 }
 
-// ─── Hook: candle data + load more ───────────────────────────────────────────
-function useCandleData(symbol = "BTCUSDT", interval = "15") {
+// ─── Hook: candle data + load more (provider-driven) ──────────────────────────
+function useCandleData(providerId = DEFAULT_PROVIDER_ID, interval = "15") {
+  const provider = getProvider(providerId);
   const [candles, setCandles] = useState([]);
   const [liveCandle, setLiveCandle] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -99,12 +89,13 @@ function useCandleData(symbol = "BTCUSDT", interval = "15") {
   const loadingMoreRef = useRef(false);
   const hasMoreRef = useRef(true);
 
-  // ── WebSocket refs ──────────────────────────────────────────────────────────
   const wsRef = useRef(null);
   const pingRef = useRef(null);
   const reconnectRef = useRef(null);
-  const backoffRef = useRef(1000); // doubles on each failure, max 30s
+  const backoffRef = useRef(1000);
   const mountedRef = useRef(true);
+  const liveCandleRef = useRef(liveCandle);
+  useEffect(() => { liveCandleRef.current = liveCandle; }, [liveCandle]);
 
   const fetchInitial = useCallback(async () => {
     setCandles([]);
@@ -114,36 +105,26 @@ function useCandleData(symbol = "BTCUSDT", interval = "15") {
     loadingMoreRef.current = false;
     hasMoreRef.current = true;
     try {
-      const url = `https://api.bybit.com/v5/market/kline?symbol=${symbol}&category=linear&interval=${interval}&limit=1000`;
-      const res = await window.fetch(url);
-      const data = await res.json();
-      if (data.retCode !== 0) throw new Error(data.retMsg);
-      const list = data.result.list;
-      if (list.length < 1000) hasMoreRef.current = false;
-      setCandles(normalizeList(list));
+      const { list, hasMore } = await provider.fetchInitial(interval);
+      hasMoreRef.current = hasMore;
+      setCandles(list);
     } catch (err) {
       setError(err.message);
     } finally {
       setLoading(false);
     }
-  }, [symbol, interval]);
+  }, [providerId, interval]);
 
   const fetchMore = useCallback(async (beforeTimestampMs) => {
     if (loadingMoreRef.current || !hasMoreRef.current) return;
     loadingMoreRef.current = true;
     try {
-      const url = `https://api.bybit.com/v5/market/kline?symbol=${symbol}&category=linear&interval=${interval}&limit=1000&end=${beforeTimestampMs - 1}`;
-      const res = await window.fetch(url);
-      const data = await res.json();
-      if (data.retCode !== 0) return;
-      const list = data.result.list;
-      if (list.length < 1000) hasMoreRef.current = false;
+      const { list, hasMore } = await provider.fetchMore(interval, beforeTimestampMs);
+      hasMoreRef.current = hasMore;
       if (list.length === 0) return;
-      const older = normalizeList(list);
       setCandles((prev) => {
-        // Filter candles đã có để tránh trùng lặp khi race condition
         const prevOldestTime = prev.length > 0 ? prev[0].time : Infinity;
-        const filtered = older.filter((c) => c.time < prevOldestTime);
+        const filtered = list.filter((c) => c.time < prevOldestTime);
         return filtered.length > 0 ? [...filtered, ...prev] : prev;
       });
     } catch {
@@ -151,43 +132,39 @@ function useCandleData(symbol = "BTCUSDT", interval = "15") {
     } finally {
       loadingMoreRef.current = false;
     }
-  }, [symbol, interval]);
+  }, [providerId, interval]);
 
   useEffect(() => { fetchInitial(); }, [fetchInitial]);
 
-  // ── WebSocket: connect + subscribe + heartbeat + reconnect ──────────────────
   const connectWs = useCallback(() => {
     if (!mountedRef.current) return;
     clearTimeout(reconnectRef.current);
+    const useWs = provider.wsSupportsInterval && provider.wsSupportsInterval(interval);
+    if (!useWs) return;
 
-    const ws = new WebSocket("wss://stream.bybit.com/v5/public/linear");
+    const ws = new WebSocket(provider.wsUrl);
     wsRef.current = ws;
 
     ws.onopen = () => {
-      ws.send(JSON.stringify({ op: "subscribe", args: [`kline.${interval}.${symbol}`] }));
-      backoffRef.current = 1000; // reset backoff on successful connect
-      pingRef.current = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ op: "ping" }));
-      }, 20000);
+      const payloads = provider.getWsSubscribePayload(interval);
+      if (Array.isArray(payloads)) {
+        payloads.forEach((p) => ws.send(JSON.stringify(p)));
+      } else if (payloads) {
+        ws.send(JSON.stringify(payloads));
+      }
+      backoffRef.current = 1000;
+      const pingInterval = provider.startWsPing?.(ws);
+      if (pingInterval != null) pingRef.current = pingInterval;
     };
 
     ws.onmessage = (event) => {
-      const msg = JSON.parse(event.data);
-      if (!msg.topic?.startsWith("kline.") || !msg.data?.length) return;
-      const d = msg.data[0];
-      const ts = parseInt(d.start);
-      const candle = {
-        timestamp: ts,
-        time: Math.floor(ts / 1000),
-        open: parseFloat(d.open),
-        high: parseFloat(d.high),
-        low: parseFloat(d.low),
-        close: parseFloat(d.close),
-        volume: parseFloat(d.volume),
-      };
+      const parsed = provider.parseWsMessage(event.data);
+      if (!parsed?.candle) return;
+      const { candle, confirm } = parsed;
+      const prevLive = liveCandleRef.current;
+      const isNewTime = prevLive && prevLive.time !== candle.time;
 
-      if (d.confirm) {
-        // Bar just closed → move into confirmed candles
+      if (confirm) {
         setCandles((prev) => {
           if (!prev.length) return prev;
           const last = prev[prev.length - 1];
@@ -196,35 +173,43 @@ function useCandleData(symbol = "BTCUSDT", interval = "15") {
           return prev;
         });
         setLiveCandle(null);
+      } else if (isNewTime) {
+        setCandles((prev) => {
+          const last = prev[prev.length - 1];
+          if (last?.time === prevLive.time) return [...prev.slice(0, -1), prevLive];
+          return [...prev, prevLive];
+        });
+        setLiveCandle(candle);
       } else {
-        // Bar still forming → update live candle only
         setLiveCandle(candle);
       }
     };
 
     ws.onclose = () => {
-      clearInterval(pingRef.current);
+      if (pingRef.current) clearInterval(pingRef.current);
+      pingRef.current = null;
       if (!mountedRef.current) return;
       const delay = backoffRef.current;
       backoffRef.current = Math.min(backoffRef.current * 2, 30000);
       reconnectRef.current = setTimeout(connectWs, delay);
     };
 
-    ws.onerror = () => ws.close(); // triggers onclose → reconnect
-  }, [symbol, interval]);
+    ws.onerror = () => ws.close();
+  }, [providerId, interval]);
 
   useEffect(() => {
     mountedRef.current = true;
-    connectWs();
+    if (provider.wsSupportsInterval?.(interval)) connectWs();
     return () => {
       mountedRef.current = false;
-      clearInterval(pingRef.current);
+      if (pingRef.current) clearInterval(pingRef.current);
       clearTimeout(reconnectRef.current);
       wsRef.current?.close();
+      wsRef.current = null;
     };
   }, [connectWs]);
 
-  return { candles, liveCandle, loading, error, refetch: fetchInitial, fetchMore, hasMoreRef, loadingMoreRef };
+  return { candles, liveCandle, loading, error, refetch: fetchInitial, fetchMore, hasMoreRef, loadingMoreRef, provider };
 }
 
 // ─── Component: StrategyControls ─────────────────────────────────────────────
@@ -330,7 +315,7 @@ function StrategyControls({ selectedId, params, onStrategyChange, onParamChange,
 }
 
 // ─── Component: CandlestickChart ─────────────────────────────────────────────
-function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, loadingMoreRef, selectedInterval, onIntervalChange }) {
+function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, loadingMoreRef, selectedInterval, onIntervalChange, selectedProviderId, onProviderChange, symbolLabel }) {
   const containerRef = useRef(null);
   const chartRef = useRef(null);
   const candleSeriesRef = useRef(null);
@@ -513,7 +498,16 @@ function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, 
     <div style={{ display: "flex", flexDirection: "column", height: "100%", background: THEME.bgPrimary }}>
       {/* Header */}
       <div style={{ padding: "8px 14px", display: "flex", alignItems: "center", gap: 16, borderBottom: `1px solid ${THEME.bgSecondary}`, flexShrink: 0, userSelect: "none" }}>
-        <span style={{ color: THEME.textPrimary, fontWeight: 700, fontSize: 13 }}>BTCUSDT · 15m</span>
+        <select
+          value={selectedProviderId}
+          onChange={(e) => onProviderChange(e.target.value)}
+          style={{ background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "3px 8px", fontSize: 12, cursor: "pointer" }}
+        >
+          {PROVIDERS.map((p) => (
+            <option key={p.id} value={p.id}>{p.name}</option>
+          ))}
+        </select>
+        <span style={{ color: THEME.textPrimary, fontWeight: 700, fontSize: 13 }}>{symbolLabel} · {INTERVALS.find((i) => i.value === selectedInterval)?.label ?? selectedInterval}</span>
         {displayBar && (
           <div style={{ display: "flex", gap: 10, fontSize: 12, fontFamily: "'Source Code Pro', monospace" }}>
             {[["O", displayBar.open], ["H", displayBar.high], ["L", displayBar.low], ["C", displayBar.close]].map(([label, val]) => (
@@ -1120,9 +1114,11 @@ function simulateTrailingStop(trade, allCandles, trailPct, minFePct) {
 
 // ─── App root ─────────────────────────────────────────────────────────────────
 export default function App() {
+  const [selectedProviderId, setSelectedProviderId] = useState(DEFAULT_PROVIDER_ID);
   const [selectedInterval, setSelectedInterval] = useState("15");
-  const { candles, liveCandle, loading, error, refetch, fetchMore, hasMoreRef, loadingMoreRef } =
-    useCandleData("BTCUSDT", selectedInterval);
+  const { candles, liveCandle, loading, error, refetch, fetchMore, hasMoreRef, loadingMoreRef, provider } =
+    useCandleData(selectedProviderId, selectedInterval);
+  const symbolLabel = provider?.getSymbol?.() ?? "—";
 
   // Strategy state
   const [selectedStrategyId, setSelectedStrategyId] = useState(STRATEGIES[0].id);
@@ -1207,6 +1203,9 @@ export default function App() {
           loadingMoreRef={loadingMoreRef}
           selectedInterval={selectedInterval}
           onIntervalChange={setSelectedInterval}
+          selectedProviderId={selectedProviderId}
+          onProviderChange={setSelectedProviderId}
+          symbolLabel={symbolLabel}
         />
       </div>
 
