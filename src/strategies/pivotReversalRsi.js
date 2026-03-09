@@ -152,4 +152,36 @@ export const PivotReversalRsiStrategy = {
 
     return signals;
   },
+
+  getPendingLevels(candles, { leftBars, rightBars, rsiLength, rsiLong, rsiShort }) {
+    if (!candles.length) return { buy: null, sell: null };
+    const TICK = BTCUSDT_MINTICK;
+    const rsiArr = calcRSI(candles, rsiLength);
+    let hprice = 0, le = false, lprice = 0, se = false;
+
+    for (let i = 0; i < candles.length; i++) {
+      const bar = candles[i];
+      if (i > 0) {
+        if (le && hprice > 0 && bar.high >= hprice + TICK) le = false;
+        if (se && lprice > 0 && bar.low <= lprice - TICK) se = false;
+      }
+      const swh = getPivotHigh(candles, i, leftBars, rightBars);
+      const swl = getPivotLow(candles, i, leftBars, rightBars);
+      if (swh !== null) {
+        hprice = swh;
+        const rsiAtPivot = rsiArr[i - rightBars];
+        le = rsiAtPivot === null || rsiAtPivot < rsiLong;
+      } else if (le && bar.high > hprice) le = false;
+      if (swl !== null) {
+        lprice = swl;
+        const rsiAtPivot = rsiArr[i - rightBars];
+        se = rsiAtPivot === null || rsiAtPivot > rsiShort;
+      } else if (se && bar.low < lprice) se = false;
+    }
+
+    return {
+      buy:  le && hprice > 0 ? hprice + TICK : null,
+      sell: se && lprice > 0 ? lprice - TICK : null,
+    };
+  },
 };

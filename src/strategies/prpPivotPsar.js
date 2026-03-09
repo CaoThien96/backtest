@@ -338,4 +338,52 @@ export const PrpPivotPsarStrategy = {
 
     return signals;
   },
+
+  getPendingLevels(candles, {
+    leftBars, rightBars,
+    ppType, ppLevels,
+    useZoneFilter, zonePct,
+    tradeDir,
+  }) {
+    if (!candles.length) return { buy: null, sell: null };
+    const TICK = BTCUSDT_MINTICK;
+    const pivotLevels = computeDailyPivotLevels(candles, ppType);
+    const zoneFilterEnabled = useZoneFilter === "Yes";
+    const canLong  = tradeDir === "Both" || tradeDir === "Long";
+    const canShort = tradeDir === "Both" || tradeDir === "Short";
+
+    let hprice = 0, lprice = 0, longArmed = false, shortArmed = false;
+
+    for (let i = 0; i < candles.length; i++) {
+      const bar = candles[i];
+      const levels = pivotLevels[i];
+
+      if (i > 0) {
+        if (longArmed && hprice > 0 && bar.high >= hprice + TICK) longArmed = false;
+        if (shortArmed && lprice > 0 && bar.low <= lprice - TICK) shortArmed = false;
+      }
+
+      const swh = getPivotHigh(candles, i, leftBars, rightBars);
+      const swl = getPivotLow(candles, i, leftBars, rightBars);
+      if (swh !== null) hprice = swh;
+      if (swl !== null) lprice = swl;
+
+      if (swl !== null) {
+        const zoneOk = !zoneFilterEnabled || isNearSupport(lprice, levels, ppLevels, zonePct);
+        if (zoneOk) longArmed = true;
+        else if (longArmed && bar.high > hprice) longArmed = false;
+      } else if (longArmed && bar.high > hprice) longArmed = false;
+
+      if (swh !== null) {
+        const zoneOk = !zoneFilterEnabled || isNearResistance(hprice, levels, ppLevels, zonePct);
+        if (zoneOk) shortArmed = true;
+        else if (shortArmed && bar.low < lprice) shortArmed = false;
+      } else if (shortArmed && bar.low < lprice) shortArmed = false;
+    }
+
+    return {
+      buy:  canLong  && longArmed  && hprice > 0 ? hprice + TICK : null,
+      sell: canShort && shortArmed && lprice > 0 ? lprice - TICK : null,
+    };
+  },
 };

@@ -164,4 +164,33 @@ export const PivotReversalStrategy = {
 
     return signals;
   },
+
+  getPendingLevels(candles, { leftBars, rightBars }) {
+    if (!candles.length) return { buy: null, sell: null };
+    const TICK = BTCUSDT_MINTICK;
+    let hprice = 0, le = false, lprice = 0, se = false;
+
+    for (let i = 0; i < candles.length; i++) {
+      const bar = candles[i];
+      if (i > 0) {
+        const longStop = hprice + TICK;
+        if (le && hprice > 0 && bar.high >= longStop - PRICE_EPS) le = false;
+        const shortStop = lprice - TICK;
+        if (se && lprice > 0 && bar.low <= shortStop + PRICE_EPS) se = false;
+      }
+      const swh = getPivotHigh(candles, i, leftBars, rightBars);
+      const swl = getPivotLow(candles, i, leftBars, rightBars);
+      if (swh !== null) hprice = swh;
+      if (swh !== null) le = true;
+      else if (le && bar.high > hprice) le = false;
+      if (swl !== null) lprice = swl;
+      if (swl !== null) se = true;
+      else if (se && bar.low < lprice) se = false;
+    }
+
+    return {
+      buy:  le && hprice > 0 ? hprice + TICK : null,
+      sell: se && lprice > 0 ? lprice - TICK : null,
+    };
+  },
 };

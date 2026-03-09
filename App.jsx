@@ -341,12 +341,14 @@ function StrategyControls({ selectedId, params, onStrategyChange, onParamChange,
 }
 
 // ─── Component: CandlestickChart ─────────────────────────────────────────────
-function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, loadingMoreRef, selectedInterval, onIntervalChange, selectedProviderId, onProviderChange, symbolLabel }) {
+function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, loadingMoreRef, selectedInterval, onIntervalChange, selectedProviderId, onProviderChange, symbolLabel, pendingBuy, pendingSell }) {
   const containerRef = useRef(null);
   const chartRef = useRef(null);
   const candleSeriesRef = useRef(null);
   const volSeriesRef = useRef(null);
   const priceLineRef = useRef(null);
+  const pendingBuyLineRef = useRef(null);
+  const pendingSellLineRef = useRef(null);
   const isFirstDataRef = useRef(true);
   const [entryMarkerPositions, setEntryMarkerPositions] = useState([]); // { x, y, type } for overlay triangles
   const [overlayKey, setOverlayKey] = useState(0);
@@ -501,6 +503,53 @@ function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, 
     markers.sort((a, b) => a.time - b.time);
     cs.setMarkers(markers);
   }, [trades]);
+
+  // ── Pending buy/sell price lines ─────────────────────────────────────────────
+  useEffect(() => {
+    const cs = candleSeriesRef.current;
+    if (!cs) return;
+
+    if (pendingBuyLineRef.current) {
+      cs.removePriceLine(pendingBuyLineRef.current);
+      pendingBuyLineRef.current = null;
+    }
+    if (pendingBuy != null && typeof pendingBuy === "number") {
+      pendingBuyLineRef.current = cs.createPriceLine({
+        price: pendingBuy,
+        color: THEME.green,
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: "Pending buy",
+      });
+    }
+
+    if (pendingSellLineRef.current) {
+      cs.removePriceLine(pendingSellLineRef.current);
+      pendingSellLineRef.current = null;
+    }
+    if (pendingSell != null && typeof pendingSell === "number") {
+      pendingSellLineRef.current = cs.createPriceLine({
+        price: pendingSell,
+        color: THEME.red,
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: "Pending sell",
+      });
+    }
+
+    return () => {
+      if (pendingBuyLineRef.current) {
+        cs.removePriceLine(pendingBuyLineRef.current);
+        pendingBuyLineRef.current = null;
+      }
+      if (pendingSellLineRef.current) {
+        cs.removePriceLine(pendingSellLineRef.current);
+        pendingSellLineRef.current = null;
+      }
+    };
+  }, [pendingBuy, pendingSell]);
 
   // ── Vị trí pixel cho tam giác ngang (đỉnh chỉ vào giá entry) ─────────────────
   // Tọa độ từ chart là relative to pane; lấy pane offset từ DOM nếu có.
@@ -1358,6 +1407,13 @@ export default function App() {
     return trades;
   }, [trades, partialEnabled, partialThresholdPct, partialCloseRatioPct, trailEnabled, trailPct, minFePct, candles, liveCandleForBacktest]);
 
+  const pendingLevels = useMemo(() => {
+    const s = STRATEGY_MAP[selectedStrategyId];
+    if (!s.getPendingLevels || !candles.length) return { buy: null, sell: null };
+    const allCandles = liveCandleForBacktest ? [...candles, liveCandleForBacktest] : candles;
+    return s.getPendingLevels(allCandles, strategyParams);
+  }, [selectedStrategyId, strategyParams, candles, liveCandleForBacktest]);
+
   if (loading) return <Loading />;
   if (error) return <ErrorState message={error} onRetry={refetch} />;
 
@@ -1399,6 +1455,8 @@ export default function App() {
           selectedProviderId={selectedProviderId}
           onProviderChange={setSelectedProviderId}
           symbolLabel={symbolLabel}
+          pendingBuy={trades.length > 0 && trades[trades.length - 1].isOpen && trades[trades.length - 1].type === "Long" ? null : pendingLevels.buy}
+          pendingSell={trades.length > 0 && trades[trades.length - 1].isOpen && trades[trades.length - 1].type === "Short" ? null : pendingLevels.sell}
         />
       </div>
 
