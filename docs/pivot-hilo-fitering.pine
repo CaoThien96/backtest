@@ -1,0 +1,82 @@
+//@version=4
+strategy(title="Pivot Hilo Stop Order Strategy", shorttitle="PVT_STOP_STRAT", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// --- INPUTS ---
+ShowPivots   = input(true, title="Show Pivot Points")
+left         = input(5, minval=1, title="Pivot Length Left Side")
+right        = input(5, minval=1, title="Pivot Length Right Side")
+Shunt        = input(1, minval=0, maxval=1, title="Wait for Candle Close (0=No, 1=Yes)")
+uRenko       = input(false, title="Use Renko Style (Open/Close for High/Low)")
+
+// Filtering Inputs
+uMAf         = input(true, title="Use MA Filter on Stops")
+fast_ma_type = input(defval="EMA", title="Fast MA Type", options=["SMA", "EMA", "WMA", "Hull MA", "ZeroLag EMA"])
+fast_ma_len  = input(defval=21, title="Fast MA - Length")
+slow_ma_type = input(defval="EMA", title="Slow MA Type", options=["SMA", "EMA", "WMA", "Hull MA", "ZeroLag EMA"])
+slow_ma_len  = input(defval=55, title="Slow MA - Length")
+
+// --- FUNCTIONS ---
+variant(type, src, len) =>
+    v_ema = ema(src, len)
+    v_sma = sma(src, len)
+    v_wma = wma(src, len)
+    // Hull MA logic
+    v_hma = wma(2 * wma(src, len / 2) - wma(src, len), round(sqrt(len)))
+    // ZeroLag EMA logic
+    xLag = (len - 1) / 2
+    v_zlema = ema((src + (src - src[xLag])), len)
+    
+    type == "EMA" ? v_ema : type == "WMA" ? v_wma : type == "Hull MA" ? v_hma : type == "ZeroLag EMA" ? v_zlema : v_sma
+
+// --- SERIES VARIABLES ---
+high_ = uRenko ? max(close, open) : high
+low_  = uRenko ? min(close, open) : low
+
+fast_ma = variant(fast_ma_type, close, fast_ma_len)
+slow_ma = variant(slow_ma_type, close, slow_ma_len)
+
+plot(fast_ma, color=color.lime, title="Fast MA")
+plot(slow_ma, color=color.gray, title="Slow MA")
+
+// --- PIVOT LOGIC ---
+// Sử dụng hàm built-in để tối ưu tốc độ
+pvthi_raw = pivothigh(high_, left, right)
+pvtlo_raw = pivotlow(low_, left, right)
+
+// Fix giá trị Pivot tại nến xác nhận (offset by 'right')
+pvthis = valuewhen(pvthi_raw, high_[right], 0)
+pvtlos = valuewhen(pvtlo_raw, low_[right], 0)
+
+// Vẽ đường kháng cự/hỗ trợ
+plot(pvthis, color=color.maroon, linewidth=1, style=plot.style_stepline, title="Resistance")
+plot(pvtlos, color=color.green, linewidth=1, style=plot.style_stepline, title="Support")
+
+// --- STOP ORDER EXECUTION LOGIC ---
+// Điều kiện lọc xu hướng: Chỉ Long khi Fast MA > Slow MA và ngược lại
+canLong  = not uMAf or (fast_ma > slow_ma and close > fast_ma)
+canShort = not uMAf or (fast_ma < slow_ma and close < fast_ma)
+
+// Đặt lệnh Stop (Pending Order)
+// Ngay khi giá chạm mức Pivot + 1 tick, lệnh sẽ được kích hoạt tức thì.
+if (canLong and not na(pvthis))
+    strategy.entry("PvtLE", strategy.long, stop=pvthis + syminfo.mintick, comment="Long Stop")
+
+if (canShort and not na(pvtlos))
+    strategy.entry("PvtSE", strategy.short, stop=pvtlos - syminfo.mintick, comment="Short Stop")
+
+// Hủy lệnh nếu xu hướng MA đảo chiều để tránh dính Trap
+if (not canLong)
+    strategy.cancel("PvtLE")
+if (not canShort)
+    strategy.cancel("PvtSE")
+
+// --- ALERT JSON FOR BOT (BYBIT V5) ---
+// Gửi giá Trigger cụ thể sang Bot để sàn đặt lệnh StopMarket
+alert_long  = '{"symbol":"{{ticker}}","side":"Buy","orderType":"StopMarket","triggerPrice":"' + tostring(pvthis + syminfo.mintick) + '","qty":"{{strategy.order.contracts}}"}'
+alert_short = '{"symbol":"{{ticker}}","side":"Sell","orderType":"StopMarket","triggerPrice":"' + tostring(pvtlos - syminfo.mintick) + '","qty":"{{strategy.order.contracts}}"}'
+
+if (canLong and pvthi_raw)
+    alert(alert_long, alert.freq_once_per_bar_close)
+
+if (canShort and pvtlo_raw)
+    alert(alert_short, alert.freq_once_per_bar_close)

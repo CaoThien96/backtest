@@ -342,7 +342,23 @@ function StrategyControls({ selectedId, params, onStrategyChange, onParamChange,
 }
 
 // ─── Component: CandlestickChart ─────────────────────────────────────────────
-function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, loadingMoreRef, selectedInterval, onIntervalChange, selectedProviderId, onProviderChange, symbolLabel, pendingBuy, pendingSell }) {
+function CandlestickChart({
+  candles,
+  trades,
+  liveCandle,
+  fetchMore,
+  hasMoreRef,
+  loadingMoreRef,
+  selectedInterval,
+  onIntervalChange,
+  selectedProviderId,
+  onProviderChange,
+  symbolLabel,
+  pendingBuy,
+  pendingSell,
+  activeStopLoss,
+  activeTakeProfit,
+}) {
   const containerRef = useRef(null);
   const chartRef = useRef(null);
   const candleSeriesRef = useRef(null);
@@ -350,6 +366,8 @@ function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, 
   const priceLineRef = useRef(null);
   const pendingBuyLineRef = useRef(null);
   const pendingSellLineRef = useRef(null);
+   const slLineRef = useRef(null);
+   const tpLineRef = useRef(null);
   const isFirstDataRef = useRef(true);
   const [entryMarkerPositions, setEntryMarkerPositions] = useState([]); // { x, y, type } for overlay triangles
   const [overlayKey, setOverlayKey] = useState(0);
@@ -567,6 +585,53 @@ function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, 
       }
     };
   }, [pendingBuy, pendingSell]);
+
+  // ── Active StopLoss / TakeProfit lines for open trade ────────────────────────
+  useEffect(() => {
+    const cs = candleSeriesRef.current;
+    if (!cs) return;
+
+    if (slLineRef.current) {
+      cs.removePriceLine(slLineRef.current);
+      slLineRef.current = null;
+    }
+    if (typeof activeStopLoss === "number" && Number.isFinite(activeStopLoss)) {
+      slLineRef.current = cs.createPriceLine({
+        price: activeStopLoss,
+        color: THEME.red,
+        lineWidth: 1,
+        lineStyle: LineStyle.Solid,
+        axisLabelVisible: true,
+        title: "Stop Loss",
+      });
+    }
+
+    if (tpLineRef.current) {
+      cs.removePriceLine(tpLineRef.current);
+      tpLineRef.current = null;
+    }
+    if (typeof activeTakeProfit === "number" && Number.isFinite(activeTakeProfit)) {
+      tpLineRef.current = cs.createPriceLine({
+        price: activeTakeProfit,
+        color: THEME.blue,
+        lineWidth: 1,
+        lineStyle: LineStyle.Solid,
+        axisLabelVisible: true,
+        title: "Take Profit",
+      });
+    }
+
+    return () => {
+      if (slLineRef.current) {
+        cs.removePriceLine(slLineRef.current);
+        slLineRef.current = null;
+      }
+      if (tpLineRef.current) {
+        cs.removePriceLine(tpLineRef.current);
+        tpLineRef.current = null;
+      }
+    };
+  }, [activeStopLoss, activeTakeProfit]);
 
   // ── Vị trí pixel cho tam giác ngang (đỉnh chỉ vào giá entry) ─────────────────
   // Tọa độ từ chart là relative to pane; lấy pane offset từ DOM nếu có.
@@ -1431,6 +1496,42 @@ export default function App() {
     return s.getPendingLevels(allCandles, strategyParams);
   }, [selectedStrategyId, strategyParams, candles, liveCandleForBacktest]);
 
+  const activeExitLevels = useMemo(() => {
+    const strategy = STRATEGY_MAP[selectedStrategyId];
+    if (!strategy || !strategy.getActiveExitLevels) return { stopLoss: null, takeProfit: null };
+    if (!candles.length || trades.length === 0) return { stopLoss: null, takeProfit: null };
+
+    const openTrade = trades[trades.length - 1];
+    if (!openTrade || !openTrade.isOpen) return { stopLoss: null, takeProfit: null };
+
+    const allCandles = liveCandleForBacktest ? [...candles, liveCandleForBacktest] : candles;
+    const levels = strategy.getActiveExitLevels(allCandles, strategyParams, openTrade);
+    if (!levels) return { stopLoss: null, takeProfit: null };
+    let { stopLoss, takeProfit } = levels;
+
+    // For PRP strategy: if current StopLoss is beyond the opposite pending
+    // stop entry level, it will never be hit (reversal happens first), so we
+    // hide the SL line to avoid visual clutter.
+    if (selectedStrategyId === "prp-pivot-psar") {
+      const pendingBuy = pendingLevels.buy;
+      const pendingSell = pendingLevels.sell;
+      if (openTrade.type === "Long" && typeof stopLoss === "number" && typeof pendingSell === "number") {
+        if (stopLoss < pendingSell) {
+          stopLoss = null;
+        }
+      } else if (openTrade.type === "Short" && typeof stopLoss === "number" && typeof pendingBuy === "number") {
+        if (stopLoss > pendingBuy) {
+          stopLoss = null;
+        }
+      }
+    }
+
+    return {
+      stopLoss: typeof stopLoss === "number" && Number.isFinite(stopLoss) ? stopLoss : null,
+      takeProfit: typeof takeProfit === "number" && Number.isFinite(takeProfit) ? takeProfit : null,
+    };
+  }, [selectedStrategyId, strategyParams, candles, liveCandleForBacktest, trades, pendingLevels]);
+
   if (loading) return <Loading />;
   if (error) return <ErrorState message={error} onRetry={refetch} />;
 
@@ -1474,6 +1575,8 @@ export default function App() {
           symbolLabel={symbolLabel}
           pendingBuy={trades.length > 0 && trades[trades.length - 1].isOpen && trades[trades.length - 1].type === "Long" ? null : pendingLevels.buy}
           pendingSell={trades.length > 0 && trades[trades.length - 1].isOpen && trades[trades.length - 1].type === "Short" ? null : pendingLevels.sell}
+          activeStopLoss={activeExitLevels.stopLoss}
+          activeTakeProfit={activeExitLevels.takeProfit}
         />
       </div>
 

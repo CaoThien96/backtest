@@ -73,14 +73,15 @@ export const PivotReversalStrategy = {
   paramSchema: {
     leftBars:  { type: "number", label: "Left Bars",  default: 3, min: 1, max: 50 },
     rightBars: { type: "number", label: "Right Bars", default: 3, min: 1, max: 50 },
+    minTick:   { type: "number", label: "Min Tick",   default: 1, min: 0, max: 500, step: 0.1 },
   },
 
   // Pure function: candles[] + params → signals[]
   // Mô phỏng stop order logic của TradingView:
   //   - Stop order đặt cuối bar N, execute tại bar N+1 nếu giá cross stop level
-  generateSignals(candles, { leftBars, rightBars }) {
+  generateSignals(candles, { leftBars, rightBars, minTick }) {
     const signals = [];
-    const TICK = BTCUSDT_MINTICK;
+    const TICK = minTick ?? BTCUSDT_MINTICK;
 
     // State machines khớp với Pine Script variables
     let hprice = 0; // last pivot high price
@@ -165,9 +166,9 @@ export const PivotReversalStrategy = {
     return signals;
   },
 
-  getPendingLevels(candles, { leftBars, rightBars }) {
+  getPendingLevels(candles, { leftBars, rightBars, minTick }) {
     if (!candles.length) return { buy: null, sell: null };
-    const TICK = BTCUSDT_MINTICK;
+    const TICK = minTick ?? BTCUSDT_MINTICK;
     let hprice = 0, le = false, lprice = 0, se = false;
 
     for (let i = 0; i < candles.length; i++) {

@@ -7,6 +7,12 @@ import { PivotReversalAtrStrategy } from "./pivotReversalAtr";
 import { PivotReversalRsiStrategy } from "./pivotReversalRsi";
 import { MomentumZigzagStrategy }   from "./momentumZigzag";
 import { PrpPivotPsarStrategy }     from "./prpPivotPsar";
+import { ChannelBreakoutStrategy }  from "./channelBreakout";
+import { MomentumStrategy }         from "./momentum";
+import { CenteredRsiCrossStrategy } from "./centeredRsiCross";
+import { Ema200TrendlineBreakoutStrategy } from "./ema200TrendlineBreakout";
+import { PivotSupertrendStrategy }  from "./pivotSupertrend";
+import { PivotHiloFilteringStrategy } from "./pivotHiloFiltering";
 
 export const STRATEGIES = [
   PivotReversalStrategy,
@@ -14,6 +20,12 @@ export const STRATEGIES = [
   PivotReversalRsiStrategy,
   MomentumZigzagStrategy,
   PrpPivotPsarStrategy,
+  ChannelBreakoutStrategy,
+  MomentumStrategy,
+  CenteredRsiCrossStrategy,
+  Ema200TrendlineBreakoutStrategy,
+  PivotSupertrendStrategy,
+  PivotHiloFilteringStrategy,
 ];
 
 export const STRATEGY_MAP = Object.fromEntries(

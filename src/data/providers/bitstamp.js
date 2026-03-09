@@ -11,7 +11,7 @@ const CURRENCY_PAIR = "btcusd";
 const INTERVAL_TO_STEP = {
   "5": 300,
   "15": 900,
-  "30": 900,
+  "30": 1800,
   "60": 3600,
   "240": 14400,
   D: 86400,

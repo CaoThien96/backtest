@@ -188,6 +188,27 @@ function isNearResistance(price, levels, ppLevels, zonePct) {
   return pts.some(p => Math.abs(price - p) <= w);
 }
 
+// ── Shared Exit Levels Helper ──────────────────────────────────────────────────
+// Computes effective Stop Loss and Take Profit for a given bar, matching
+// makeExitFn logic (ATR-based SL/TP + optional PSAR trailing).
+function computeExitLevels(type, entryPrice, bar, atr, psar, slMultiplier, tpMultiplier, psarEnabled) {
+  if (!atr) return { stopLoss: null, takeProfit: null };
+
+  if (type === "long") {
+    const fixedSL    = entryPrice - atr * slMultiplier;
+    const tp         = entryPrice + atr * tpMultiplier;
+    const usePsarNow = psarEnabled && psar !== null && psar < bar.close;
+    const effectiveSL = usePsarNow ? Math.max(fixedSL, psar) : fixedSL;
+    return { stopLoss: effectiveSL, takeProfit: tp };
+  }
+
+  const fixedSL    = entryPrice + atr * slMultiplier;
+  const tp         = entryPrice - atr * tpMultiplier;
+  const usePsarNow = psarEnabled && psar !== null && psar > bar.close;
+  const effectiveSL = usePsarNow ? Math.min(fixedSL, psar) : fixedSL;
+  return { stopLoss: effectiveSL, takeProfit: tp };
+}
+
 // ── Strategy Object ───────────────────────────────────────────────────────────
 export const PrpPivotPsarStrategy = {
   id: "prp-pivot-psar",
@@ -208,6 +229,7 @@ export const PrpPivotPsarStrategy = {
     useZoneFilter:{ type: "select", label: "Zone Filter",   default: "Yes", options: ["Yes", "No"]         },
     zonePct:      { type: "number", label: "Zone Width %",  default: 2.6,  min: 0.1,   max: 5,   step: 0.1 },
     tradeDir:     { type: "select", label: "Direction",     default: "Both", options: ["Long", "Short", "Both"] },
+    minTick:      { type: "number", label: "Min Tick",      default: 1,    min: 0,    max: 500, step: 0.1 },
   },
 
   generateSignals(candles, {
@@ -217,8 +239,9 @@ export const PrpPivotPsarStrategy = {
     usePSAR, psarStart, psarInc, psarMax,
     useZoneFilter, zonePct,
     tradeDir,
+    minTick,
   }) {
-    const TICK = BTCUSDT_MINTICK;
+    const TICK = minTick ?? BTCUSDT_MINTICK;
 
     // Precompute indicator arrays
     const atrArr      = calcATR(candles, atrPeriod);
@@ -236,20 +259,47 @@ export const PrpPivotPsarStrategy = {
       const psar = psarArr[barIndex];
       if (!atr) return null;
 
+      const { stopLoss, takeProfit } = computeExitLevels(
+        type,
+        entryPrice,
+        bar,
+        atr,
+        psar,
+        slMultiplier,
+        tpMultiplier,
+        psarEnabled
+      );
+
       if (type === "long") {
-        const fixedSL    = entryPrice - atr * slMultiplier;
-        const tp         = entryPrice + atr * tpMultiplier;
-        const usePsarNow = psarEnabled && psar !== null && psar < bar.close;
-        const effectiveSL = usePsarNow ? Math.max(fixedSL, psar) : fixedSL;
-        if (bar.low  <= effectiveSL) return { exitPrice: Math.min(bar.open, effectiveSL), exitSignal: "Stop Loss",   timestamp: bar.timestamp };
-        if (bar.high >= tp)          return { exitPrice: Math.max(bar.open, tp),           exitSignal: "Take Profit", timestamp: bar.timestamp };
+        if (stopLoss != null && bar.low <= stopLoss) {
+          return {
+            exitPrice: Math.min(bar.open, stopLoss),
+            exitSignal: "Stop Loss",
+            timestamp: bar.timestamp,
+          };
+        }
+        if (takeProfit != null && bar.high >= takeProfit) {
+          return {
+            exitPrice: Math.max(bar.open, takeProfit),
+            exitSignal: "Take Profit",
+            timestamp: bar.timestamp,
+          };
+        }
       } else {
-        const fixedSL    = entryPrice + atr * slMultiplier;
-        const tp         = entryPrice - atr * tpMultiplier;
-        const usePsarNow = psarEnabled && psar !== null && psar > bar.close;
-        const effectiveSL = usePsarNow ? Math.min(fixedSL, psar) : fixedSL;
-        if (bar.high >= effectiveSL) return { exitPrice: Math.max(bar.open, effectiveSL), exitSignal: "Stop Loss",   timestamp: bar.timestamp };
-        if (bar.low  <= tp)          return { exitPrice: Math.min(bar.open, tp),           exitSignal: "Take Profit", timestamp: bar.timestamp };
+        if (stopLoss != null && bar.high >= stopLoss) {
+          return {
+            exitPrice: Math.max(bar.open, stopLoss),
+            exitSignal: "Stop Loss",
+            timestamp: bar.timestamp,
+          };
+        }
+        if (takeProfit != null && bar.low <= takeProfit) {
+          return {
+            exitPrice: Math.min(bar.open, takeProfit),
+            exitSignal: "Take Profit",
+            timestamp: bar.timestamp,
+          };
+        }
       }
       return null;
     };
@@ -344,9 +394,10 @@ export const PrpPivotPsarStrategy = {
     ppType, ppLevels,
     useZoneFilter, zonePct,
     tradeDir,
+    minTick,
   }) {
     if (!candles.length) return { buy: null, sell: null };
-    const TICK = BTCUSDT_MINTICK;
+    const TICK = minTick ?? BTCUSDT_MINTICK;
     const pivotLevels = computeDailyPivotLevels(candles, ppType);
     const zoneFilterEnabled = useZoneFilter === "Yes";
     const canLong  = tradeDir === "Both" || tradeDir === "Long";
@@ -385,5 +436,40 @@ export const PrpPivotPsarStrategy = {
       buy:  canLong  && longArmed  && hprice > 0 ? hprice + TICK : null,
       sell: canShort && shortArmed && lprice > 0 ? lprice - TICK : null,
     };
+  },
+
+  // Returns current effective SL/TP levels for the active open trade, to be
+  // visualized as horizontal lines on the chart. Only used for PRP strategy.
+  getActiveExitLevels(candles, {
+    atrPeriod, slMultiplier, tpMultiplier,
+    usePSAR, psarStart, psarInc, psarMax,
+  }, openTrade) {
+    if (!candles.length || !openTrade) return { stopLoss: null, takeProfit: null };
+
+    const { entryPrice, entryBarIndex } = openTrade;
+    if (entryBarIndex == null || entryPrice == null) return { stopLoss: null, takeProfit: null };
+
+    const side = openTrade.type === "Long" ? "long" : "short";
+    const atrArr  = calcATR(candles, atrPeriod);
+    const psarArr = calcPSAR(candles, psarStart, psarInc, psarMax);
+    const psarEnabled = usePSAR === "Yes";
+
+    const barIndex = candles.length - 1;
+    if (barIndex < 0 || barIndex >= candles.length) return { stopLoss: null, takeProfit: null };
+
+    const bar  = candles[barIndex];
+    const atr  = atrArr[barIndex];
+    const psar = psarArr[barIndex];
+
+    return computeExitLevels(
+      side,
+      entryPrice,
+      bar,
+      atr,
+      psar,
+      slMultiplier,
+      tpMultiplier,
+      psarEnabled
+    );
   },
 };

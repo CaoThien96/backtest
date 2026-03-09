@@ -1,0 +1,61 @@
+// @version=6
+strategy("BB trading strategy", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// --- 1. 參數設定 ---
+tf_big      = input.timeframe("30", "大週期參考基準")
+lookback    = input.int(2, "止損參考K棒數", minval=1)
+riskReward  = input.float(1, "目標盈虧比")
+
+bbLen       = input.int(7, "布林週期")
+bbMult      = input.float(2.0, "布林標準差")
+
+emaSlow_big = request.security(syminfo.tickerid, tf_big, ta.ema(close, 50))
+
+[bbMid, bbUpper, bbLower] = ta.bb(close, bbLen, bbMult)
+
+// 當前週期 
+ema6  = ta.ema(close, 6)
+ema20 = ta.ema(close, 20)
+[m_1m, s_1m, h_1m] = ta.macd(close, 12, 26, 9)
+
+// 止損基準
+recent_high = ta.highest(high, lookback)
+recent_low  = ta.lowest(low, lookback)
+
+// --- 3. 布林帶---
+bb_long_ok = close > bbMid and close < bbUpper 
+bb_short_ok = close < bbMid and close > bbLower
+
+// --- 4. 進場條件 ( BB + EMA + MACD + 30m Trend) ---
+long_cond  = (close > emaSlow_big) and ta.crossover(ema6, ema20) and h_1m > 0 and h_1m > h_1m[1] and bb_long_ok
+short_cond = (close < emaSlow_big) and ta.crossunder(ema6, ema20) and h_1m < 0 and h_1m < h_1m[1] and bb_short_ok
+
+
+var float sl_price = na
+var float tp_price = na
+var float entry_price = na
+
+if long_cond and strategy.position_size == 0
+    sl_price := recent_low
+    entry_price := close
+    float risk = close - sl_price
+    if risk > 0
+        tp_price := close + (risk * riskReward)
+        strategy.entry("多", strategy.long, comment="BB過濾多")
+
+if short_cond and strategy.position_size == 0
+    sl_price := recent_high
+    entry_price := close
+    float risk = sl_price - close
+    if risk > 0
+        tp_price := close - (risk * riskReward)
+        strategy.entry("空", strategy.short, comment="BB過濾空")
+
+if strategy.position_size != 0
+    strategy.exit("Exit", stop=sl_price, limit=tp_price)
+
+// --- 6. 視覺化 ---
+plot(bbUpper, "布林上軌", color=color.new(color.gray, 70))
+plot(bbLower, "布林下軌", color=color.new(color.gray, 70))
+plot(bbMid,   "布林中軌", color=color.new(color.blue, 80))
+plot(emaSlow_big, "30m 基準線", color=color.new(color.white, 50), linewidth=2)
