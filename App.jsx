@@ -213,7 +213,7 @@ function useCandleData(providerId = DEFAULT_PROVIDER_ID, interval = "15") {
 }
 
 // ─── Component: StrategyControls ─────────────────────────────────────────────
-function StrategyControls({ selectedId, params, onStrategyChange, onParamChange, positionSize, onPositionSizeChange, trailEnabled, onTrailEnabledChange, trailPct, onTrailPctChange, minFePct, onMinFePctChange }) {
+function StrategyControls({ selectedId, params, onStrategyChange, onParamChange, positionSize, onPositionSizeChange, partialThresholdPct, onPartialThresholdPctChange, partialCloseRatioPct, onPartialCloseRatioPctChange, trailEnabled, onTrailEnabledChange, trailPct, onTrailPctChange, minFePct, onMinFePctChange }) {
   const strategy = STRATEGY_MAP[selectedId];
 
   return (
@@ -239,6 +239,32 @@ function StrategyControls({ selectedId, params, onStrategyChange, onParamChange,
           step={1000}
           onChange={(e) => onPositionSizeChange(Number(e.target.value))}
           style={{ width: 72, background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 12, textAlign: "center" }}
+        />
+      </label>
+
+      {/* Chốt lời: threshold % + tỷ lệ chốt % */}
+      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: THEME.textSecondary }}>
+        Chốt lời khi lời (%)
+        <input
+          type="number"
+          value={partialThresholdPct}
+          min={0}
+          max={100}
+          step={0.1}
+          onChange={(e) => onPartialThresholdPctChange(Math.max(0, Number(e.target.value)))}
+          style={{ width: 52, background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 12, textAlign: "center" }}
+        />
+      </label>
+      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: THEME.textSecondary }}>
+        Tỷ lệ chốt (%)
+        <input
+          type="number"
+          value={partialCloseRatioPct}
+          min={0}
+          max={100}
+          step={1}
+          onChange={(e) => onPartialCloseRatioPctChange(Math.max(0, Math.min(100, Number(e.target.value))))}
+          style={{ width: 52, background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 12, textAlign: "center" }}
         />
       </label>
 
@@ -1190,6 +1216,66 @@ function simulateTrailingStop(trade, allCandles, trailPct, minFePct) {
   return null; // trail never triggered — keep actual netPnL
 }
 
+// ─── Partial Take Profit (chốt lời) Simulator ─────────────────────────────────
+// When unrealized profit >= thresholdPct%, close closeRatioPct% at threshold price,
+// then run remainder with stop at entry (breakeven). Returns { netPnL } or null.
+function simulatePartialTakeProfit(trade, allCandles, thresholdPct, closeRatioPct) {
+  const { entryBarIndex, exitBarIndex, entryPrice, positionSize, type, exitPrice: originalExitPrice } = trade;
+  if (entryBarIndex == null || exitBarIndex == null || thresholdPct <= 0 || closeRatioPct <= 0 || closeRatioPct > 100) return null;
+
+  const isLong = trade.type === "Long";
+  const thresholdPrice = isLong
+    ? entryPrice * (1 + thresholdPct / 100)
+    : entryPrice * (1 - thresholdPct / 100);
+
+  for (let i = entryBarIndex + 1; i <= exitBarIndex; i++) {
+    const bar = allCandles[i];
+    if (!bar) break;
+
+    const profitPct = isLong
+      ? ((bar.high - entryPrice) / entryPrice) * 100
+      : ((entryPrice - bar.low) / entryPrice) * 100;
+
+    if (profitPct < thresholdPct) continue;
+
+    // First bar where threshold reached: partial close at threshold price
+    const partialSize = positionSize * (closeRatioPct / 100);
+    const remainderSize = positionSize * (1 - closeRatioPct / 100);
+    const partialPnL = isLong
+      ? (thresholdPrice - entryPrice) * partialSize
+      : (entryPrice - thresholdPrice) * partialSize;
+
+    // Remainder: same bar then i+1..exitBarIndex — breakeven at entry or original exit
+    const hitEntry = (b) => (isLong ? b.low <= entryPrice : b.high >= entryPrice);
+    let remainderExitPrice = null;
+
+    if (hitEntry(bar)) {
+      remainderExitPrice = entryPrice;
+    } else {
+      for (let j = i + 1; j <= exitBarIndex; j++) {
+        const b = allCandles[j];
+        if (!b) break;
+        if (hitEntry(b)) {
+          remainderExitPrice = entryPrice;
+          break;
+        }
+      }
+      if (remainderExitPrice === null) {
+        const lastBar = allCandles[exitBarIndex];
+        remainderExitPrice = originalExitPrice ?? lastBar?.close ?? entryPrice;
+      }
+    }
+
+    const remainderPnL = isLong
+      ? (remainderExitPrice - entryPrice) * remainderSize
+      : (entryPrice - remainderExitPrice) * remainderSize;
+
+    return { netPnL: partialPnL + remainderPnL };
+  }
+
+  return null; // threshold never reached — keep original trade
+}
+
 // ─── App root ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [selectedProviderId, setSelectedProviderId] = useState(DEFAULT_PROVIDER_ID);
@@ -1205,6 +1291,8 @@ export default function App() {
   const [trailEnabled, setTrailEnabled] = useState(false);
   const [trailPct, setTrailPct]         = useState(10);
   const [minFePct, setMinFePct]         = useState(1); // min FE% of position to activate trail
+  const [partialThresholdPct, setPartialThresholdPct] = useState(0);
+  const [partialCloseRatioPct, setPartialCloseRatioPct] = useState(50);
 
   // Cập nhật params khi đổi strategy
   const handleStrategyChange = (id) => {
@@ -1228,24 +1316,47 @@ export default function App() {
     return runBacktest(allCandles, sigs, { positionSizeUSDT: positionSize });
   }, [candles, liveCandleForBacktest, selectedStrategyId, strategyParams, positionSize]);
 
+  const partialEnabled = partialThresholdPct > 0 && partialCloseRatioPct > 0 && partialCloseRatioPct <= 100;
+
   const displayTrades = useMemo(() => {
-    if (!trailEnabled || trades.length === 0) return trades;
+    if (trades.length === 0) return trades;
     const allCandles = liveCandleForBacktest ? [...candles, liveCandleForBacktest] : candles;
     const initialCapital = trades[0].positionValue;
-    let cumPnL = 0;
-    return trades.map((t) => {
-      const trailPnL = simulateTrailingStop(t, allCandles, trailPct, minFePct);
-      const simPnL   = trailPnL !== null ? trailPnL : t.netPnL;
-      cumPnL += simPnL;
-      return {
-        ...t,
-        netPnL:               simPnL,
-        netPnLPercent:        (simPnL / t.positionValue) * 100,
-        cumulativePnL:        cumPnL,
-        cumulativePnLPercent: (cumPnL / initialCapital) * 100,
-      };
-    });
-  }, [trades, trailEnabled, trailPct, minFePct, candles, liveCandleForBacktest]);
+
+    if (partialEnabled) {
+      let cumPnL = 0;
+      return trades.map((t) => {
+        const result = simulatePartialTakeProfit(t, allCandles, partialThresholdPct, partialCloseRatioPct);
+        const simPnL = result != null ? result.netPnL : t.netPnL;
+        cumPnL += simPnL;
+        return {
+          ...t,
+          netPnL:               simPnL,
+          netPnLPercent:        (simPnL / t.positionValue) * 100,
+          cumulativePnL:        cumPnL,
+          cumulativePnLPercent: (cumPnL / initialCapital) * 100,
+        };
+      });
+    }
+
+    if (trailEnabled) {
+      let cumPnL = 0;
+      return trades.map((t) => {
+        const trailPnL = simulateTrailingStop(t, allCandles, trailPct, minFePct);
+        const simPnL   = trailPnL !== null ? trailPnL : t.netPnL;
+        cumPnL += simPnL;
+        return {
+          ...t,
+          netPnL:               simPnL,
+          netPnLPercent:        (simPnL / t.positionValue) * 100,
+          cumulativePnL:        cumPnL,
+          cumulativePnLPercent: (cumPnL / initialCapital) * 100,
+        };
+      });
+    }
+
+    return trades;
+  }, [trades, partialEnabled, partialThresholdPct, partialCloseRatioPct, trailEnabled, trailPct, minFePct, candles, liveCandleForBacktest]);
 
   if (loading) return <Loading />;
   if (error) return <ErrorState message={error} onRetry={refetch} />;
@@ -1262,6 +1373,10 @@ export default function App() {
         onParamChange={handleParamChange}
         positionSize={positionSize}
         onPositionSizeChange={setPositionSize}
+        partialThresholdPct={partialThresholdPct}
+        onPartialThresholdPctChange={setPartialThresholdPct}
+        partialCloseRatioPct={partialCloseRatioPct}
+        onPartialCloseRatioPctChange={setPartialCloseRatioPct}
         trailEnabled={trailEnabled}
         onTrailEnabledChange={setTrailEnabled}
         trailPct={trailPct}
