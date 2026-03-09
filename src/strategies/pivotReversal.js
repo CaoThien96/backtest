@@ -15,51 +15,53 @@
 //   PivRevLE: mua khi giá VƯỢT LÊN TRÊN pivot high (breakout mua)
 //   PivRevSE: bán khi giá XUYÊN XUỐNG DƯỚI pivot low (breakdown bán)
 
-const BTCUSDT_MINTICK = 0; // Bybit BTCUSDT Perp mintick = $0.1
+const BTCUSDT_MINTICK = 1; // Bybit BTCUSDT Perp mintick = $0.1
 const PRICE_EPS = 1e-9; // float-safe: bar.high >= stopLevel can fail when stopLevel = 67449.3+0.1
 
 // Debug: set window.__PIVOT_DEBUG_TS__ = 1741389300 (0h15 8 Mar 2026 UTC) then refetch/change interval to log that bar
 
-// ── Pivot High Detection ──────────────────────────────────────────────────────
-// Tại bar i, kiểm tra bar (i - rightBars) có là pivot high không:
-// high tại (i - rightBars) phải là highest trong window [i-leftBars-rightBars .. i]
+// ── Pivot High Detection (TradingView logic) ────────────────────────────────────
+// Tại bar i, kiểm tra bar (i - rightBars) có là pivot high không.
+// Bên phải: thấp hơn chặt (không bằng) để chuẩn TradingView.
 function getPivotHigh(candles, i, leftBars, rightBars) {
   const pivotIdx = i - rightBars;
-  if (pivotIdx < leftBars) return null;
+  if (pivotIdx < leftBars || pivotIdx + rightBars >= candles.length) return null;
 
-  const pivotHigh = candles[pivotIdx].high;
+  const ph = candles[pivotIdx].high;
 
-  // Left bars: tất cả phải thấp hơn pivot high (strictly less)
+  // Bên trái: Không được có nến nào CAO HƠN ph
   for (let j = pivotIdx - leftBars; j < pivotIdx; j++) {
-    if (candles[j].high >= pivotHigh) return null;
+    if (candles[j].high > ph) return null;
   }
 
-  // Right bars: tất cả phải thấp hơn pivot high (strictly less)
+  // Bên phải: Tất cả nến phải THẤP HƠN ph (Không được bằng)
   for (let j = pivotIdx + 1; j <= i; j++) {
-    if (candles[j].high >= pivotHigh) return null;
+    if (candles[j].high >= ph) return null;
   }
 
-  return pivotHigh;
+  return ph;
 }
 
-// ── Pivot Low Detection ───────────────────────────────────────────────────────
+// ── Pivot Low Detection (TradingView logic) ─────────────────────────────────────
+// Tại bar i, kiểm tra bar (i - rightBars) có là pivot low không.
+// Bên phải: cao hơn chặt (không bằng) để chuẩn TradingView.
 function getPivotLow(candles, i, leftBars, rightBars) {
   const pivotIdx = i - rightBars;
-  if (pivotIdx < leftBars) return null;
+  if (pivotIdx < leftBars || pivotIdx + rightBars >= candles.length) return null;
 
-  const pivotLow = candles[pivotIdx].low;
+  const pl = candles[pivotIdx].low;
 
-  // Left bars: tất cả phải cao hơn pivot low (strictly greater)
+  // Bên trái: Không được có nến nào THẤP HƠN pl
   for (let j = pivotIdx - leftBars; j < pivotIdx; j++) {
-    if (candles[j].low <= pivotLow) return null;
+    if (candles[j].low < pl) return null;
   }
 
-  // Right bars: tất cả phải cao hơn pivot low (strictly greater)
+  // Bên phải: Tất cả nến phải CAO HƠN pl (Không được bằng)
   for (let j = pivotIdx + 1; j <= i; j++) {
-    if (candles[j].low <= pivotLow) return null;
+    if (candles[j].low <= pl) return null;
   }
 
-  return pivotLow;
+  return pl;
 }
 
 // ── Strategy Object ───────────────────────────────────────────────────────────

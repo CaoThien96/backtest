@@ -322,6 +322,9 @@ function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, 
   const volSeriesRef = useRef(null);
   const priceLineRef = useRef(null);
   const isFirstDataRef = useRef(true);
+  const [entryMarkerPositions, setEntryMarkerPositions] = useState([]); // { x, y, type } for overlay triangles
+  const [overlayKey, setOverlayKey] = useState(0);
+  const [overlaySize, setOverlaySize] = useState({ w: 0, h: 0 });
 
   const candlesRef = useRef(candles);
   const fetchMoreRef = useRef(fetchMore);
@@ -364,6 +367,8 @@ function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, 
       priceLineVisible: false,
     });
     volSeries.priceScale().applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
+
+    chart.timeScale().subscribeVisibleTimeRangeChange(() => setOverlayKey((k) => k + 1));
 
     chart.subscribeCrosshairMove((param) => {
       if (param.time) {
@@ -455,8 +460,6 @@ function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, 
   }, [liveCandle]);
 
   // ── Cập nhật signal markers ─────────────────────────────────────────────────
-  // Derive markers from trades (not raw signals) to avoid spurious markers
-  // from signals the engine ignored (same-direction, no pyramiding).
   useEffect(() => {
     const cs = candleSeriesRef.current;
     if (!cs) return;
@@ -472,6 +475,51 @@ function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, 
     markers.sort((a, b) => a.time - b.time);
     cs.setMarkers(markers);
   }, [trades]);
+
+  // ── Vị trí pixel cho tam giác ngang (đỉnh chỉ vào giá entry) ─────────────────
+  // Tọa độ từ chart là relative to pane; lấy pane offset từ DOM nếu có.
+  useEffect(() => {
+    if (trades.length === 0) {
+      setEntryMarkerPositions([]);
+      return;
+    }
+    const chart = chartRef.current;
+    const cs = candleSeriesRef.current;
+    if (!chart || !cs) return;
+
+    const compute = () => {
+      const ts = chart.timeScale();
+      const positions = [];
+      for (const trade of trades) {
+        const t = Math.floor(trade.entryTimestamp / 1000);
+        const x = ts.timeToCoordinate(t);
+        const y = cs.priceToCoordinate(trade.entryPrice);
+        if (x != null && y != null) positions.push({ x, y, type: trade.type });
+      }
+      setEntryMarkerPositions(positions);
+    };
+
+    compute();
+    const id = requestAnimationFrame(() => {
+      requestAnimationFrame(compute);
+    });
+    return () => cancelAnimationFrame(id);
+  }, [trades, overlayKey, candles.length]);
+
+  // Recompute overlay positions when chart container resizes; track size for SVG viewBox
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const sync = () => {
+      setOverlayKey((k) => k + 1);
+      const { width, height } = el.getBoundingClientRect();
+      setOverlaySize((s) => (s.w === width && s.h === height ? s : { w: width, h: height }));
+    };
+    const ro = new ResizeObserver(sync);
+    ro.observe(el);
+    sync();
+    return () => ro.disconnect();
+  }, []);
 
   // ── Timeframe buttons ────────────────────────────────────────────────────────
   const handleTimeframe = useCallback((tf) => {
@@ -526,8 +574,26 @@ function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, 
         </div>
       </div>
 
-      {/* Chart */}
-      <div ref={containerRef} style={{ flex: 1, position: "relative" }} />
+      {/* Chart + overlay tam giác ngang tại giá entry */}
+      <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
+        <div ref={containerRef} style={{ position: "absolute", inset: 0 }} />
+        <div style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 10 }}>
+          <svg width="100%" height="100%" viewBox={overlaySize.w && overlaySize.h ? `0 0 ${overlaySize.w} ${overlaySize.h}` : undefined} preserveAspectRatio="none" style={{ display: "block", overflow: "visible" }}>
+            {entryMarkerPositions.map((pos, i) => {
+              const w = 10;
+              const h = 4;
+              const color = pos.type === "Long" ? THEME.blue : THEME.red;
+              // Long: tam giác bên trái nến, đỉnh phải chỉ vào thân (tip at x,y)
+              // Short: tam giác bên phải nến, đỉnh trái chỉ vào thân (tip at x,y)
+              const points =
+                pos.type === "Long"
+                  ? `${pos.x - w},${pos.y - h} ${pos.x - w},${pos.y + h} ${pos.x},${pos.y}`
+                  : `${pos.x + w},${pos.y - h} ${pos.x + w},${pos.y + h} ${pos.x},${pos.y}`;
+              return <polygon key={i} points={points} fill={color} />;
+            })}
+          </svg>
+        </div>
+      </div>
 
       {/* Bottom bar: interval selector + zoom buttons */}
       <div style={{ display: "flex", alignItems: "center", gap: 2, padding: "6px 12px", borderTop: `1px solid ${THEME.bgSecondary}`, flexShrink: 0 }}>
@@ -978,6 +1044,14 @@ function StrategyReport({ trades, strategyName }) {
   const closedTrades = trades.filter((t) => !t.isOpen).length;
   const totalPnL = trades.reduce((sum, t) => (!t.isOpen ? sum + t.netPnL : sum), 0);
 
+  const closed = trades.filter((t) => !t.isOpen);
+  const winners = closed.filter((t) => t.netPnL > 0);
+  const losers = closed.filter((t) => t.netPnL < 0);
+  const avgWinPct = winners.length > 0 ? winners.reduce((s, t) => s + (t.netPnLPercent ?? 0), 0) / winners.length : null;
+  const avgLossPct = losers.length > 0 ? losers.reduce((s, t) => s + (t.netPnLPercent ?? 0), 0) / losers.length : null;
+  const maxWinPct = winners.length > 0 ? Math.max(...winners.map((t) => t.netPnLPercent ?? 0)) : null;
+  const maxLossPct = losers.length > 0 ? Math.min(...losers.map((t) => t.netPnLPercent ?? 0)) : null;
+
   const firstTs = trades.length > 0 ? trades[0].entryTimestamp : null;
   const startDateStr = firstTs
     ? new Date(firstTs).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })
@@ -987,9 +1061,9 @@ function StrategyReport({ trades, strategyName }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", background: THEME.bgPrimary, borderTop: `1px solid ${THEME.border}` }}>
       {/* Panel header */}
-      <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 14px", borderBottom: `1px solid ${THEME.bgSecondary}`, flexShrink: 0 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 14px", borderBottom: `1px solid ${THEME.bgSecondary}`, flexShrink: 0, flexWrap: "wrap" }}>
         <span style={{ color: THEME.textPrimary, fontWeight: 600, fontSize: 13 }}>{strategyName}</span>
-        <div style={{ marginLeft: "auto", display: "flex", gap: 16, fontSize: 11, color: THEME.textSecondary }}>
+        <div style={{ marginLeft: "auto", display: "flex", gap: 16, fontSize: 11, color: THEME.textSecondary, flexWrap: "wrap" }}>
           {startDateStr && <span>From: {startDateStr}</span>}
           {totalDays !== null && <span>{totalDays} days</span>}
           <span>{closedTrades} trades</span>
@@ -997,6 +1071,10 @@ function StrategyReport({ trades, strategyName }) {
           <span style={{ color: totalPnL >= 0 ? THEME.green : THEME.red, fontWeight: 600 }}>
             Total P&L: {totalPnL >= 0 ? "+" : ""}{formatPrice(totalPnL)} USDT
           </span>
+          <span>Avg Win: {avgWinPct != null ? `${avgWinPct >= 0 ? "+" : ""}${avgWinPct.toFixed(2)}%` : "—"}</span>
+          <span>Avg Loss: {avgLossPct != null ? `${avgLossPct.toFixed(2)}%` : "—"}</span>
+          <span>Max Win: {maxWinPct != null ? `+${maxWinPct.toFixed(2)}%` : "—"}</span>
+          <span>Max Loss: {maxLossPct != null ? `${maxLossPct.toFixed(2)}%` : "—"}</span>
         </div>
       </div>
 
