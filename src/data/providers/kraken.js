@@ -8,12 +8,13 @@ const KRAKEN_REST = "https://api.kraken.com/0/public/OHLC";
 const KRAKEN_WS = "wss://ws.kraken.com/v2";
 const PAGE_SIZE = 720; // Kraken returns up to 720 of the most recent candles; no backward pagination
 
-// App interval "5"|"15"|"30"|"60"|"D" → Kraken interval (minutes)
+// App interval "5"|"15"|"30"|"60"|"240"|"D" → Kraken interval (minutes)
 const INTERVAL_TO_MINUTES = {
   "5": 5,
   "15": 15,
   "30": 30,
   "60": 60,
+  "240": 240,
   D: 1440,
 };
 

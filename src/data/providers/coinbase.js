@@ -6,12 +6,13 @@ const COINBASE_REST = "https://api.exchange.coinbase.com";
 const COINBASE_WS = "wss://advanced-trade-ws.coinbase.com";
 const PAGE_SIZE = 300;
 
-// App interval "5"|"15"|"30"|"60"|"D" → Coinbase granularity (seconds)
+// App interval "5"|"15"|"30"|"60"|"240"|"D" → Coinbase granularity (seconds). 4h not supported; use 21600 (6h).
 const INTERVAL_TO_GRANULARITY = {
   "5": 300,
   "15": 900,
   "30": 900,
   "60": 3600,
+  "240": 21600,
   D: 86400,
 };
 

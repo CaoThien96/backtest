@@ -21,6 +21,7 @@ const INTERVALS = [
   { label: "15m", value: "15" },
   { label: "30m", value: "30" },
   { label: "1h",  value: "60" },
+  { label: "4h",  value: "240" },
   { label: "1d",  value: "D"  },
 ];
 
@@ -355,6 +356,7 @@ function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, 
   const [overlaySize, setOverlaySize] = useState({ w: 0, h: 0 });
 
   const candlesRef = useRef(candles);
+  const lastChartTimeRef = useRef(null); // last time in chart (set when we setData); update() only allowed if live >= this
   const fetchMoreRef = useRef(fetchMore);
   const liveCandleRef = useRef(liveCandle);
   useEffect(() => { candlesRef.current = candles; }, [candles]);
@@ -434,13 +436,25 @@ function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, 
     const chart = chartRef.current;
     if (!cs || !vs || candles.length === 0) return;
 
-    cs.setData(candles.map((c) => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close })));
-    vs.setData(candles.map((c) => ({ time: c.time, value: c.volume, color: c.close >= c.open ? `${THEME.green}55` : `${THEME.red}55` })));
+    // Ensure asc order and unique times (lightweight-charts requirement; fixes 1d / fetchMore ordering)
+    const sorted = [...candles].sort((a, b) => a.time - b.time);
+    const seen = new Set();
+    const ordered = sorted.filter((c) => {
+      if (seen.has(c.time)) return false;
+      seen.add(c.time);
+      return true;
+    });
+
+    cs.setData(ordered.map((c) => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close })));
+    vs.setData(ordered.map((c) => ({ time: c.time, value: c.volume, color: c.close >= c.open ? `${THEME.green}55` : `${THEME.red}55` })));
+
+    const lastTime = ordered[ordered.length - 1]?.time ?? null;
+    lastChartTimeRef.current = lastTime;
 
     // Restore live bar if present (setData wipes it)
     // Guard: skip if live candle is stale from a previous interval
     const live = liveCandleRef.current;
-    const liveValid = live && live.time >= candles[candles.length - 1].time;
+    const liveValid = live && lastTime != null && live.time >= lastTime;
     if (liveValid) {
       cs.update({ time: live.time, open: live.open, high: live.high, low: live.low, close: live.close });
       vs.update({ time: live.time, value: live.volume, color: live.close >= live.open ? `${THEME.green}55` : `${THEME.red}55` });
@@ -448,7 +462,7 @@ function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, 
 
     if (priceLineRef.current) cs.removePriceLine(priceLineRef.current);
     priceLineRef.current = cs.createPriceLine({
-      price: (liveValid ? live : candles[candles.length - 1]).close,
+      price: (liveValid ? live : ordered[ordered.length - 1]).close,
       color: THEME.textSecondary,
       lineWidth: 1,
       lineStyle: LineStyle.Dashed,
@@ -466,13 +480,16 @@ function CandlestickChart({ candles, trades, liveCandle, fetchMore, hasMoreRef, 
     const cs = candleSeriesRef.current;
     const vs = volSeriesRef.current;
     if (!cs || !vs || !liveCandle) return;
+    // Don't update when chart has no data (e.g. loading after interval change)
+    if (candlesRef.current.length === 0) return;
 
-    // Guard: skip stale WS tick from previous interval (its time < last confirmed bar)
-    const confirmed = candlesRef.current;
-    if (confirmed.length > 0 && liveCandle.time < confirmed[confirmed.length - 1].time) return;
+    // lightweight-charts: update() only allows same time (update last bar) or newer (append). Never older.
+    const lastInChart = lastChartTimeRef.current;
+    if (lastInChart != null && liveCandle.time < lastInChart) return;
 
     cs.update({ time: liveCandle.time, open: liveCandle.open, high: liveCandle.high, low: liveCandle.low, close: liveCandle.close });
     vs.update({ time: liveCandle.time, value: liveCandle.volume, color: liveCandle.close >= liveCandle.open ? `${THEME.green}55` : `${THEME.red}55` });
+    lastChartTimeRef.current = liveCandle.time;
 
     // Keep price line on latest live price
     if (priceLineRef.current) {

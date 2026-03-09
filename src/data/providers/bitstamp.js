@@ -7,12 +7,13 @@ const BITSTAMP_WS = "wss://ws.bitstamp.net";
 const PAGE_SIZE = 1000;
 const CURRENCY_PAIR = "btcusd";
 
-// App interval "5"|"15"|"30"|"60"|"D" → Bitstamp step (seconds)
+// App interval "5"|"15"|"30"|"60"|"240"|"D" → Bitstamp step (seconds)
 const INTERVAL_TO_STEP = {
   "5": 300,
   "15": 900,
   "30": 900,
   "60": 3600,
+  "240": 14400,
   D: 86400,
 };
 
@@ -22,6 +23,7 @@ const INTERVAL_TO_WS_TIMEFRAME = {
   "15": "15m",
   "30": "30m",
   "60": "1h",
+  "240": "4h",
   D: "1d",
 };
 
