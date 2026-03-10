@@ -214,7 +214,26 @@ function useCandleData(providerId = DEFAULT_PROVIDER_ID, interval = "15") {
 }
 
 // ─── Component: StrategyControls ─────────────────────────────────────────────
-function StrategyControls({ selectedId, params, onStrategyChange, onParamChange, positionSize, onPositionSizeChange, partialThresholdPct, onPartialThresholdPctChange, partialCloseRatioPct, onPartialCloseRatioPctChange, trailEnabled, onTrailEnabledChange, trailPct, onTrailPctChange, minFePct, onMinFePctChange }) {
+function StrategyControls({
+  selectedId,
+  params,
+  onStrategyChange,
+  onParamChange,
+  positionSize,
+  onPositionSizeChange,
+  feePct,
+  onFeePctChange,
+  partialThresholdPct,
+  onPartialThresholdPctChange,
+  partialCloseRatioPct,
+  onPartialCloseRatioPctChange,
+  trailEnabled,
+  onTrailEnabledChange,
+  trailPct,
+  onTrailPctChange,
+  minFePct,
+  onMinFePctChange,
+}) {
   const strategy = STRATEGY_MAP[selectedId];
 
   return (
@@ -240,6 +259,20 @@ function StrategyControls({ selectedId, params, onStrategyChange, onParamChange,
           step={1000}
           onChange={(e) => onPositionSizeChange(Number(e.target.value))}
           style={{ width: 72, background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 12, textAlign: "center" }}
+        />
+      </label>
+
+      {/* Fee per side (% of position value) */}
+      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: THEME.textSecondary }}>
+        Fee % mỗi chiều
+        <input
+          type="number"
+          value={feePct}
+          min={0}
+          max={2}
+          step={0.01}
+          onChange={(e) => onFeePctChange(Math.max(0, Math.min(2, Number(e.target.value))))}
+          style={{ width: 52, background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 12, textAlign: "center" }}
         />
       </label>
 
@@ -1299,8 +1332,8 @@ function ErrorState({ message, onRetry }) {
 //   Short: trailStopPrice = lowestPrice  × (1 + trailPct/100)
 // Activation: trail only arms after price moves minFePct% favorably from entry.
 // Returns simulated exit P&L in USDT, or null if trail never triggered.
-function simulateTrailingStop(trade, allCandles, trailPct, minFePct) {
-  const { entryBarIndex, exitBarIndex, entryPrice, positionSize } = trade;
+function simulateTrailingStop(trade, allCandles, trailPct, minFePct, feePctPerSide) {
+  const { entryBarIndex, exitBarIndex, entryPrice, positionSize, positionValue } = trade;
   if (entryBarIndex == null || exitBarIndex == null) return null;
 
   const isLong          = trade.type === "Long";
@@ -1332,13 +1365,19 @@ function simulateTrailingStop(trade, allCandles, trailPct, minFePct) {
         const trailStopPrice = peakPrice * (1 - trailMult);
         if (bar.low <= trailStopPrice) {
           const exitPrice = Math.min(bar.open, trailStopPrice); // gap protection
-          return (exitPrice - entryPrice) * positionSize;
+          const gross = (exitPrice - entryPrice) * positionSize;
+          const feeOpen  = positionValue * feePctPerSide;
+          const feeClose = positionValue * feePctPerSide;
+          return gross - feeOpen - feeClose;
         }
       } else {
         const trailStopPrice = peakPrice * (1 + trailMult);
         if (bar.high >= trailStopPrice) {
           const exitPrice = Math.max(bar.open, trailStopPrice); // gap protection
-          return (entryPrice - exitPrice) * positionSize;
+          const gross = (entryPrice - exitPrice) * positionSize;
+          const feeOpen  = positionValue * feePctPerSide;
+          const feeClose = positionValue * feePctPerSide;
+          return gross - feeOpen - feeClose;
         }
       }
     }
@@ -1350,8 +1389,8 @@ function simulateTrailingStop(trade, allCandles, trailPct, minFePct) {
 // ─── Partial Take Profit (chốt lời) Simulator ─────────────────────────────────
 // When unrealized profit >= thresholdPct%, close closeRatioPct% at threshold price,
 // then run remainder with stop at entry (breakeven). Returns { netPnL } or null.
-function simulatePartialTakeProfit(trade, allCandles, thresholdPct, closeRatioPct) {
-  const { entryBarIndex, exitBarIndex, entryPrice, positionSize, type, exitPrice: originalExitPrice } = trade;
+function simulatePartialTakeProfit(trade, allCandles, thresholdPct, closeRatioPct, feePctPerSide) {
+  const { entryBarIndex, exitBarIndex, entryPrice, positionSize, type, exitPrice: originalExitPrice, positionValue } = trade;
   if (entryBarIndex == null || exitBarIndex == null || thresholdPct <= 0 || closeRatioPct <= 0 || closeRatioPct > 100) return null;
 
   const isLong = trade.type === "Long";
@@ -1401,7 +1440,10 @@ function simulatePartialTakeProfit(trade, allCandles, thresholdPct, closeRatioPc
       ? (remainderExitPrice - entryPrice) * remainderSize
       : (entryPrice - remainderExitPrice) * remainderSize;
 
-    return { netPnL: partialPnL + remainderPnL };
+    const gross = partialPnL + remainderPnL;
+    const feeOpen  = positionValue * feePctPerSide;
+    const feeClose = positionValue * feePctPerSide;
+    return { netPnL: gross - feeOpen - feeClose };
   }
 
   return null; // threshold never reached — keep original trade
@@ -1418,7 +1460,8 @@ export default function App() {
   // Strategy state
   const [selectedStrategyId, setSelectedStrategyId] = useState(STRATEGIES[0].id);
   const [strategyParams, setStrategyParams] = useState(getDefaultParams(STRATEGIES[0]));
-  const [positionSize, setPositionSize] = useState(10000);
+  const [positionSize, setPositionSize] = useState(5000);
+  const [feePct, setFeePct]             = useState(0.05); // % per side (open and close)
   const [trailEnabled, setTrailEnabled] = useState(false);
   const [trailPct, setTrailPct]         = useState(10);
   const [minFePct, setMinFePct]         = useState(1); // min FE% of position to activate trail
@@ -1444,8 +1487,8 @@ export default function App() {
     if (allCandles.length === 0) return [];
     const strategy = STRATEGY_MAP[selectedStrategyId];
     const sigs = strategy.generateSignals(allCandles, strategyParams);
-    return runBacktest(allCandles, sigs, { positionSizeUSDT: positionSize });
-  }, [candles, liveCandleForBacktest, selectedStrategyId, strategyParams, positionSize]);
+    return runBacktest(allCandles, sigs, { positionSizeUSDT: positionSize, feePct: feePct / 100 });
+  }, [candles, liveCandleForBacktest, selectedStrategyId, strategyParams, positionSize, feePct]);
 
   const partialEnabled = partialThresholdPct > 0 && partialCloseRatioPct > 0 && partialCloseRatioPct <= 100;
 
@@ -1457,7 +1500,7 @@ export default function App() {
     if (partialEnabled) {
       let cumPnL = 0;
       return trades.map((t) => {
-        const result = simulatePartialTakeProfit(t, allCandles, partialThresholdPct, partialCloseRatioPct);
+        const result = simulatePartialTakeProfit(t, allCandles, partialThresholdPct, partialCloseRatioPct, feePct / 100);
         const simPnL = result != null ? result.netPnL : t.netPnL;
         cumPnL += simPnL;
         return {
@@ -1473,7 +1516,7 @@ export default function App() {
     if (trailEnabled) {
       let cumPnL = 0;
       return trades.map((t) => {
-        const trailPnL = simulateTrailingStop(t, allCandles, trailPct, minFePct);
+        const trailPnL = simulateTrailingStop(t, allCandles, trailPct, minFePct, feePct / 100);
         const simPnL   = trailPnL !== null ? trailPnL : t.netPnL;
         cumPnL += simPnL;
         return {
@@ -1492,9 +1535,8 @@ export default function App() {
   const pendingLevels = useMemo(() => {
     const s = STRATEGY_MAP[selectedStrategyId];
     if (!s.getPendingLevels || !candles.length) return { buy: null, sell: null };
-    const allCandles = liveCandleForBacktest ? [...candles, liveCandleForBacktest] : candles;
-    return s.getPendingLevels(allCandles, strategyParams);
-  }, [selectedStrategyId, strategyParams, candles, liveCandleForBacktest]);
+    return s.getPendingLevels(candles, strategyParams);
+  }, [selectedStrategyId, strategyParams, candles]);
 
   const activeExitLevels = useMemo(() => {
     const strategy = STRATEGY_MAP[selectedStrategyId];
@@ -1547,6 +1589,8 @@ export default function App() {
         onParamChange={handleParamChange}
         positionSize={positionSize}
         onPositionSizeChange={setPositionSize}
+        feePct={feePct}
+        onFeePctChange={setFeePct}
         partialThresholdPct={partialThresholdPct}
         onPartialThresholdPctChange={setPartialThresholdPct}
         partialCloseRatioPct={partialCloseRatioPct}

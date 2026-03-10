@@ -50,11 +50,15 @@ function buildTrade({
   cumulativePnL,
   isOpen = false,
   positionSizeUSDT = 10000,
+  feePct = 0,
 }) {
   const positionValue = positionSizeUSDT;
   const positionSize  = positionSizeUSDT / entryPrice; // # of contracts
 
-  const netPnL = calcNetPnL(type, entryPrice, exitPrice) * positionSize;
+  const grossPnL = calcNetPnL(type, entryPrice, exitPrice) * positionSize;
+  const feeOpen  = positionValue * feePct;
+  const feeClose = positionValue * feePct;
+  const netPnL   = grossPnL - feeOpen - feeClose;
   const netPnLPercent = (netPnL / positionValue) * 100;
 
   const { mfe, mae } = calcExcursions(
@@ -83,6 +87,9 @@ function buildTrade({
     isOpen,
     positionSize,
     positionValue,
+    grossPnL,
+    feeOpen,
+    feeClose,
     netPnL,
     netPnLPercent,
     favorableExcursion: mfeUSDT,
@@ -122,7 +129,7 @@ function checkSLTP(candles, position, upToBarIndex) {
 
 // ── Main Engine ───────────────────────────────────────────────────────────────
 
-export function runBacktest(candles, signals, { positionSizeUSDT = 10000 } = {}) {
+export function runBacktest(candles, signals, { positionSizeUSDT = 10000, feePct = 0 } = {}) {
   if (!candles.length || !signals.length) return [];
 
   const trades = [];
@@ -151,6 +158,7 @@ export function runBacktest(candles, signals, { positionSizeUSDT = 10000 } = {})
           candles,
           cumulativePnL,
           positionSizeUSDT,
+          feePct,
         });
         cumulativePnL = trade.cumulativePnL;
         trades.push(trade);
@@ -177,6 +185,7 @@ export function runBacktest(candles, signals, { positionSizeUSDT = 10000 } = {})
         candles,
         cumulativePnL,
         positionSizeUSDT,
+        feePct,
       });
 
       cumulativePnL = trade.cumulativePnL;
@@ -219,6 +228,7 @@ export function runBacktest(candles, signals, { positionSizeUSDT = 10000 } = {})
         candles,
         cumulativePnL,
         positionSizeUSDT,
+        feePct,
       });
       trades.push(trade);
     } else {
@@ -240,6 +250,7 @@ export function runBacktest(candles, signals, { positionSizeUSDT = 10000 } = {})
         cumulativePnL,
         isOpen: true,
         positionSizeUSDT,
+        feePct,
       });
 
       trades.push(trade);
