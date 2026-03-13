@@ -139,6 +139,70 @@ function isNearResistance(price, levels, ppLevels, zonePct) {
   return pts.some(p => Math.abs(price - p) <= w);
 }
 
+// ── Relative Volume (RVOL) Helper ──────────────────────────────────────────────
+// RVOL[i] = volume[i] / average(volume[i-lookback..i-1])
+function computeRvol(candles, lookback) {
+  const n = candles.length;
+  const out = new Array(n).fill(null);
+  if (!lookback || lookback <= 0) return out;
+  let sum = 0;
+  for (let i = 0; i < n; i++) {
+    const v = candles[i].volume ?? 0;
+    if (i < lookback) {
+      sum += v;
+      continue;
+    }
+    // sliding window
+    sum += v;
+    sum -= candles[i - lookback].volume ?? 0;
+    const avg = sum / lookback;
+    out[i] = avg > 0 ? v / avg : null;
+  }
+  return out;
+}
+
+// ── Money Flow Index (MFI) Helper ─────────────────────────────────────────────
+function computeMfi(candles, length) {
+  const n = candles.length;
+  const out = new Array(n).fill(null);
+  if (!length || length < 2) return out;
+
+  const tp = new Array(n).fill(0);
+  const pos = new Array(n).fill(0);
+  const neg = new Array(n).fill(0);
+
+  for (let i = 0; i < n; i++) {
+    const c = candles[i];
+    tp[i] = (c.high + c.low + c.close) / 3;
+    if (i === 0) continue;
+    const mf = tp[i] * (c.volume ?? 0);
+    if (tp[i] > tp[i - 1]) pos[i] = mf;
+    else if (tp[i] < tp[i - 1]) neg[i] = mf;
+  }
+
+  for (let i = 0; i < n; i++) {
+    if (i < length) continue;
+    let posSum = 0;
+    let negSum = 0;
+    for (let j = i - length + 1; j <= i; j++) {
+      posSum += pos[j];
+      negSum += neg[j];
+    }
+    if (negSum === 0) {
+      if (posSum === 0) {
+        out[i] = null;
+      } else {
+        out[i] = 100;
+      }
+      continue;
+    }
+    const mr = posSum / negSum;
+    out[i] = 100 - 100 / (1 + mr);
+  }
+
+  return out;
+}
+
 // ── Shared Exit Levels Helper ──────────────────────────────────────────────────
 // Computes fixed ATR-based Stop Loss and Take Profit for a given bar, matching
 // makeExitFn logic. SL/TP can be toggled on/off via useSL/useTP.
@@ -167,15 +231,20 @@ export const PrpPivotPsarStrategy = {
   name: "PRP - Pivot Reversal - PSAR Strategy",
 
   paramSchema: {
-    leftBars: { type: "number", label: "Left Bars", default: 4, min: 1, max: 50 },
+    leftBars: { type: "number", label: "Left Bars", default: 2, min: 1, max: 50 },
     rightBars: { type: "number", label: "Right Bars", default: 3, min: 1, max: 50 },
     ppType: { type: "select", label: "PP Type", default: "Woodie", options: ["Standard", "Fibonacci", "Woodie", "Camarilla"] },
     ppLevels: { type: "number", label: "PP Levels", default: 1, min: 1, max: 3 },
     atrPeriod: { type: "number", label: "ATR Period", default: 14, min: 1, max: 100 },
-    slMultiplier: { type: "number", label: "SL ATR Mult", default: 3.0, min: 0.1, max: 20, step: 0.1 },
-    tpMultiplier: { type: "number", label: "TP ATR Mult", default: 8.0, min: 0.1, max: 50, step: 0.1 },
-    useSL: { type: "select", label: "Use SL ATR", default: "No", options: ["Yes", "No"] },
+    slMultiplier: { type: "number", label: "SL ATR Mult", default: 8.8, min: 0.1, max: 20, step: 0.1 },
+    tpMultiplier: { type: "number", label: "TP ATR Mult", default: 8.8, min: 0.1, max: 50, step: 0.1 },
+    useSL: { type: "select", label: "Use SL ATR", default: "Yes", options: ["Yes", "No"] },
     useTP: { type: "select", label: "Use TP ATR", default: "Yes", options: ["Yes", "No"] },
+    filterMode: { type: "select", label: "Filter Mode", default: "RVOL", options: ["None", "RVOL", "MFI"] },
+    rvolLookback: { type: "number", label: "RVOL Lookback", default: 5, min: 1, max: 200 },
+    rvolMin: { type: "number", label: "Min RVOL", default: 1.7, min: 1, max: 5, step: 0.1 },
+    mfiLength: { type: "number", label: "MFI Length", default: 14, min: 2, max: 100 },
+    mfiMin: { type: "number", label: "MFI Min", default: 50, min: 0, max: 100 },
     useZoneFilter: { type: "select", label: "Zone Filter", default: "Yes", options: ["Yes", "No"] },
     zonePct: { type: "number", label: "Zone Width %", default: 2.6, min: 0.1, max: 5, step: 0.1 },
     tradeDir: { type: "select", label: "Direction", default: "Both", options: ["Long", "Short", "Both"] },
@@ -187,21 +256,50 @@ export const PrpPivotPsarStrategy = {
     ppType, ppLevels,
     atrPeriod, slMultiplier, tpMultiplier,
     useSL, useTP,
+    filterMode, rvolLookback, rvolMin, mfiLength, mfiMin,
     useZoneFilter, zonePct,
     tradeDir,
     minTick,
   }) {
     const TICK = minTick ?? BTCUSDT_MINTICK;
-    console.log('candles', candles)
     // Precompute indicator arrays
     const atrArr = calcATR(candles, atrPeriod);
     const pivotLevels = computeDailyPivotLevels(candles, ppType);
+
+    const useRvol = filterMode === "RVOL";
+    const useMfi = filterMode === "MFI";
+    const rvolArr = useRvol ? computeRvol(candles, rvolLookback) : null;
+    const mfiArr = useMfi ? computeMfi(candles, mfiLength) : null;
 
     const zoneFilterEnabled = useZoneFilter === "Yes";
     const canLong = tradeDir === "Both" || tradeDir === "Long";
     const canShort = tradeDir === "Both" || tradeDir === "Short";
     const useSLFlag = useSL === "Yes";
     const useTPFlag = useTP === "Yes";
+
+    const passesFilter = (type, i) => {
+      if (!useRvol && !useMfi) return true;
+      const rvol = rvolArr ? rvolArr[i] : null;
+      const mfi = mfiArr ? mfiArr[i] : null;
+      const prevMfi = i > 0 && mfiArr ? mfiArr[i - 1] : null;
+
+      if (useRvol) {
+        if (rvol == null || rvol < rvolMin) return false;
+      }
+
+      if (useMfi) {
+        if (type === "long") {
+          if (mfi == null || mfi < mfiMin) return false;
+          if (prevMfi != null && mfi <= prevMfi) return false;
+        } else {
+          const shortThresh = 100 - mfiMin;
+          if (mfi == null || mfi > shortThresh) return false;
+          if (prevMfi != null && mfi >= prevMfi) return false;
+        }
+      }
+
+      return true;
+    };
 
     // exitFn factory: closes over indicator arrays + params + entry details
     const makeExitFn = (type, entryPrice) => (bar, barIndex) => {
@@ -267,7 +365,7 @@ export const PrpPivotPsarStrategy = {
         if (longArmed && hprice > 0 && bar.high >= hprice + TICK) {
           const stopPrice = hprice + TICK;
           const entryPrice = bar.open > stopPrice ? bar.open : stopPrice;
-          if (canLong) {
+          if (canLong && passesFilter("long", i)) {
             signals.push({
               barIndex: i,
               time: bar.time,
@@ -284,7 +382,7 @@ export const PrpPivotPsarStrategy = {
         if (shortArmed && lprice > 0 && bar.low <= lprice - TICK) {
           const stopPrice = lprice - TICK;
           const entryPrice = bar.open < stopPrice ? bar.open : stopPrice;
-          if (canShort) {
+          if (canShort && passesFilter("short", i)) {
             signals.push({
               barIndex: i,
               time: bar.time,
@@ -343,14 +441,42 @@ export const PrpPivotPsarStrategy = {
     useZoneFilter, zonePct,
     tradeDir,
     minTick,
+    filterMode, rvolLookback, rvolMin, mfiLength, mfiMin,
   }) {
     if (!candles.length) return { buy: null, sell: null };
-    console.log('getPendingLevels', candles)
     const TICK = minTick ?? BTCUSDT_MINTICK;
     const pivotLevels = computeDailyPivotLevels(candles, ppType);
     const zoneFilterEnabled = useZoneFilter === "Yes";
     const canLong = tradeDir === "Both" || tradeDir === "Long";
     const canShort = tradeDir === "Both" || tradeDir === "Short";
+
+    const useRvol = filterMode === "RVOL";
+    const useMfi = filterMode === "MFI";
+    const rvolArr = useRvol ? computeRvol(candles, rvolLookback) : null;
+    const mfiArr = useMfi ? computeMfi(candles, mfiLength) : null;
+
+    const passesFilter = (type, i) => {
+      if (!useRvol && !useMfi) return true;
+      const rvol = rvolArr ? rvolArr[i] : null;
+      const mfi = mfiArr ? mfiArr[i] : null;
+      const prevMfi = i > 0 && mfiArr ? mfiArr[i - 1] : null;
+
+      if (useRvol) {
+        if (rvol == null || rvol < rvolMin) return false;
+      }
+
+      if (useMfi) {
+        if (type === "long") {
+          if (mfi == null || mfi < mfiMin) return false;
+          if (prevMfi != null && mfi <= prevMfi) return false;
+        } else {
+          const shortThresh = 100 - mfiMin;
+          if (mfi == null || mfi > shortThresh) return false;
+          if (prevMfi != null && mfi >= prevMfi) return false;
+        }
+      }
+      return true;
+    };
 
     let hprice = 0, lprice = 0, longArmed = false, shortArmed = false;
 
@@ -370,15 +496,28 @@ export const PrpPivotPsarStrategy = {
 
       if (swl !== null) {
         const zoneOk = !zoneFilterEnabled || isNearSupport(lprice, levels, ppLevels, zonePct);
-        if (zoneOk) longArmed = true;
+        if (zoneOk && passesFilter("long", i)) longArmed = true;
         else if (longArmed && bar.high > hprice) longArmed = false;
       } else if (longArmed && bar.high > hprice) longArmed = false;
 
       if (swh !== null) {
         const zoneOk = !zoneFilterEnabled || isNearResistance(hprice, levels, ppLevels, zonePct);
-        if (zoneOk) shortArmed = true;
+        if (zoneOk && passesFilter("short", i)) shortArmed = true;
         else if (shortArmed && bar.low < lprice) shortArmed = false;
       } else if (shortArmed && bar.low < lprice) shortArmed = false;
+    }
+    let ret = {
+      buy: canLong && longArmed && hprice > 0 ? hprice + TICK : null,
+      sell: canShort && shortArmed && lprice > 0 ? lprice - TICK : null,
+    }
+    if (ret.buy || ret.sell) {
+      console.warn(`==== Pending Buy|Sell ====`, {
+        buy: canLong && longArmed && hprice > 0 ? hprice + TICK : null,
+        sell: canShort && shortArmed && lprice > 0 ? lprice - TICK : null,
+        time: new Date().toISOString()
+      })
+    } else {
+      // console.log('==== No Pending Buy|Sell ====')
     }
 
     return {
@@ -415,5 +554,24 @@ export const PrpPivotPsarStrategy = {
       useSL === "Yes",
       useTP === "Yes"
     );
+  },
+
+  // Current swing pivots (for chart lines) — based on PRP's pivot detector
+  getCurrentPivots(candles, {
+    leftBars, rightBars,
+  }) {
+    if (!candles.length) return { pivotHigh: null, pivotLow: null };
+    let hprice = 0;
+    let lprice = 0;
+    for (let i = 0; i < candles.length; i++) {
+      const swh = getPivotHigh(candles, i, leftBars, rightBars);
+      const swl = getPivotLow(candles, i, leftBars, rightBars);
+      if (swh !== null) hprice = swh;
+      if (swl !== null) lprice = swl;
+    }
+    return {
+      pivotHigh: hprice > 0 ? hprice : null,
+      pivotLow:  lprice > 0 ? lprice : null,
+    };
   },
 };

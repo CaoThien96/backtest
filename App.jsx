@@ -3,6 +3,7 @@ import { createChart, LineStyle } from "lightweight-charts";
 import { STRATEGIES, STRATEGY_MAP, getDefaultParams } from "./src/strategies/index.js";
 import { runBacktest } from "./src/backtest/engine.js";
 import { getProvider, PROVIDERS, DEFAULT_PROVIDER_ID } from "./src/data/providers/index.js";
+import { getCandlesFromCache, upsertCandlesInCache, getCachedRange } from "./src/data/cache.js";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const TIMEFRAMES = [
@@ -96,19 +97,23 @@ function useCandleData(providerId = DEFAULT_PROVIDER_ID, interval = "15") {
   const backoffRef = useRef(1000);
   const mountedRef = useRef(true);
   const liveCandleRef = useRef(liveCandle);
+  const candlesRef = useRef(candles);
   useEffect(() => { liveCandleRef.current = liveCandle; }, [liveCandle]);
+  useEffect(() => { candlesRef.current = candles; }, [candles]);
 
   const fetchInitial = useCallback(async () => {
-    setCandles([]);
     setLiveCandle(null);
     setLoading(true);
     setError(null);
     loadingMoreRef.current = false;
     hasMoreRef.current = true;
+    const cached = getCandlesFromCache(providerId, interval);
+    if (cached.length > 0) setCandles(cached);
     try {
       const { list, hasMore } = await provider.fetchInitial(interval);
       hasMoreRef.current = hasMore;
       setCandles(list);
+      if (list.length > 0) upsertCandlesInCache(providerId, interval, list);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -118,16 +123,38 @@ function useCandleData(providerId = DEFAULT_PROVIDER_ID, interval = "15") {
 
   const fetchMore = useCallback(async (beforeTimestampMs) => {
     if (loadingMoreRef.current || !hasMoreRef.current) return;
+    const beforeSec = Math.floor(beforeTimestampMs / 1000);
+    const current = candlesRef.current;
+    const oldestInView = current.length > 0 ? current[0].time : Infinity;
+    let fromCache = getCandlesFromCache(providerId, interval).filter(
+      (c) => c.time < beforeSec && c.time < oldestInView
+    );
+    const CACHE_FETCH_MORE_LIMIT = 1000;
+    if (fromCache.length > CACHE_FETCH_MORE_LIMIT) {
+      fromCache = fromCache.slice(-CACHE_FETCH_MORE_LIMIT);
+    }
+    if (fromCache.length > 0) {
+      const range = getCachedRange(providerId, interval);
+      hasMoreRef.current = range != null && range.from < fromCache[0].time;
+      setCandles((prev) => {
+        const prevOldest = prev.length > 0 ? prev[0].time : Infinity;
+        const filtered = fromCache.filter((c) => c.time < prevOldest);
+        return filtered.length > 0 ? [...filtered, ...prev] : prev;
+      });
+      return;
+    }
     loadingMoreRef.current = true;
     try {
       const { list, hasMore } = await provider.fetchMore(interval, beforeTimestampMs);
       hasMoreRef.current = hasMore;
-      if (list.length === 0) return;
-      setCandles((prev) => {
-        const prevOldestTime = prev.length > 0 ? prev[0].time : Infinity;
-        const filtered = list.filter((c) => c.time < prevOldestTime);
-        return filtered.length > 0 ? [...filtered, ...prev] : prev;
-      });
+      if (list.length > 0) {
+        upsertCandlesInCache(providerId, interval, list);
+        setCandles((prev) => {
+          const prevOldestTime = prev.length > 0 ? prev[0].time : Infinity;
+          const filtered = list.filter((c) => c.time < prevOldestTime);
+          return filtered.length > 0 ? [...filtered, ...prev] : prev;
+        });
+      }
     } catch {
       // silent
     } finally {
@@ -391,6 +418,8 @@ function CandlestickChart({
   pendingSell,
   activeStopLoss,
   activeTakeProfit,
+  pivotHighPrice,
+  pivotLowPrice,
 }) {
   const containerRef = useRef(null);
   const chartRef = useRef(null);
@@ -399,8 +428,10 @@ function CandlestickChart({
   const priceLineRef = useRef(null);
   const pendingBuyLineRef = useRef(null);
   const pendingSellLineRef = useRef(null);
-   const slLineRef = useRef(null);
-   const tpLineRef = useRef(null);
+  const pivotHighLineRef = useRef(null);
+  const pivotLowLineRef = useRef(null);
+  const slLineRef = useRef(null);
+  const tpLineRef = useRef(null);
   const isFirstDataRef = useRef(true);
   const [entryMarkerPositions, setEntryMarkerPositions] = useState([]); // { x, y, type } for overlay triangles
   const [overlayKey, setOverlayKey] = useState(0);
@@ -618,6 +649,53 @@ function CandlestickChart({
       }
     };
   }, [pendingBuy, pendingSell]);
+
+  // ── Pivot High / Pivot Low lines (current swing pivots) ───────────────────────
+  useEffect(() => {
+    const cs = candleSeriesRef.current;
+    if (!cs) return;
+
+    if (pivotHighLineRef.current) {
+      cs.removePriceLine(pivotHighLineRef.current);
+      pivotHighLineRef.current = null;
+    }
+    if (typeof pivotHighPrice === "number" && Number.isFinite(pivotHighPrice)) {
+      pivotHighLineRef.current = cs.createPriceLine({
+        price: pivotHighPrice,
+        color: "#9aa3b8",
+        lineWidth: 1,
+        lineStyle: LineStyle.Solid,
+        axisLabelVisible: true,
+        title: "Pivot High",
+      });
+    }
+
+    if (pivotLowLineRef.current) {
+      cs.removePriceLine(pivotLowLineRef.current);
+      pivotLowLineRef.current = null;
+    }
+    if (typeof pivotLowPrice === "number" && Number.isFinite(pivotLowPrice)) {
+      pivotLowLineRef.current = cs.createPriceLine({
+        price: pivotLowPrice,
+        color: "#6b7280",
+        lineWidth: 1,
+        lineStyle: LineStyle.Solid,
+        axisLabelVisible: true,
+        title: "Pivot Low",
+      });
+    }
+
+    return () => {
+      if (pivotHighLineRef.current) {
+        cs.removePriceLine(pivotHighLineRef.current);
+        pivotHighLineRef.current = null;
+      }
+      if (pivotLowLineRef.current) {
+        cs.removePriceLine(pivotLowLineRef.current);
+        pivotLowLineRef.current = null;
+      }
+    };
+  }, [pivotHighPrice, pivotLowPrice]);
 
   // ── Active StopLoss / TakeProfit lines for open trade ────────────────────────
   useEffect(() => {
@@ -1452,7 +1530,7 @@ function simulatePartialTakeProfit(trade, allCandles, thresholdPct, closeRatioPc
 // ─── App root ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [selectedProviderId, setSelectedProviderId] = useState(DEFAULT_PROVIDER_ID);
-  const [selectedInterval, setSelectedInterval] = useState("15");
+  const [selectedInterval, setSelectedInterval] = useState("30");
   const { candles, liveCandle, loading, error, refetch, fetchMore, hasMoreRef, loadingMoreRef, provider } =
     useCandleData(selectedProviderId, selectedInterval);
   const symbolLabel = provider?.getSymbol?.() ?? "—";
@@ -1535,8 +1613,28 @@ export default function App() {
   const pendingLevels = useMemo(() => {
     const s = STRATEGY_MAP[selectedStrategyId];
     if (!s.getPendingLevels || !candles.length) return { buy: null, sell: null };
+    // PRP dùng cùng mảng candle với backtest (có cả live)
+    if (s.id === "prp-pivot-psar") {
+      const allCandles = liveCandleForBacktest ? [...candles, liveCandleForBacktest] : candles;
+      return s.getPendingLevels(allCandles, strategyParams);
+    }
+    // Các strategy khác vẫn dùng chỉ closed candles
     return s.getPendingLevels(candles, strategyParams);
-  }, [selectedStrategyId, strategyParams, candles]);
+  }, [selectedStrategyId, strategyParams, candles, liveCandleForBacktest]);
+
+  const pivotLevels = useMemo(() => {
+    const strategy = STRATEGY_MAP[selectedStrategyId];
+    if (!strategy?.getCurrentPivots) return { pivotHigh: null, pivotLow: null };
+    const candlesForPivots = strategy.id === "prp-pivot-psar" && liveCandleForBacktest
+      ? [...candles, liveCandleForBacktest]
+      : candles;
+    if (!candlesForPivots.length) return { pivotHigh: null, pivotLow: null };
+    const out = strategy.getCurrentPivots(candlesForPivots, strategyParams);
+    return {
+      pivotHigh: typeof out.pivotHigh === "number" && Number.isFinite(out.pivotHigh) ? out.pivotHigh : null,
+      pivotLow:  typeof out.pivotLow === "number"  && Number.isFinite(out.pivotLow)  ? out.pivotLow : null,
+    };
+  }, [selectedStrategyId, strategyParams, candles, liveCandleForBacktest]);
 
   const activeExitLevels = useMemo(() => {
     const strategy = STRATEGY_MAP[selectedStrategyId];
@@ -1621,6 +1719,8 @@ export default function App() {
           pendingSell={trades.length > 0 && trades[trades.length - 1].isOpen && trades[trades.length - 1].type === "Short" ? null : pendingLevels.sell}
           activeStopLoss={activeExitLevels.stopLoss}
           activeTakeProfit={activeExitLevels.takeProfit}
+          pivotHighPrice={pivotLevels.pivotHigh}
+          pivotLowPrice={pivotLevels.pivotLow}
         />
       </div>
 
