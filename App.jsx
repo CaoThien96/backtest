@@ -420,6 +420,8 @@ function CandlestickChart({
   activeTakeProfit,
   pivotHighPrice,
   pivotLowPrice,
+  pivotHighTime,
+  pivotLowTime,
 }) {
   const containerRef = useRef(null);
   const chartRef = useRef(null);
@@ -599,9 +601,28 @@ function CandlestickChart({
       text: trade.entrySignal,
     }));
 
+    if (typeof pivotHighTime === "number" && Number.isFinite(pivotHighTime)) {
+      markers.push({
+        time: pivotHighTime,
+        position: "aboveBar",
+        color: "#017322",
+        shape: "circle",
+        text: "ph",
+      });
+    }
+    if (typeof pivotLowTime === "number" && Number.isFinite(pivotLowTime)) {
+      markers.push({
+        time: pivotLowTime,
+        position: "belowBar",
+        color: "#C10C16",
+        shape: "circle",
+        text: "pl",
+      });
+    }
+
     markers.sort((a, b) => a.time - b.time);
     cs.setMarkers(markers);
-  }, [trades]);
+  }, [trades, pivotHighTime, pivotLowTime]);
 
   // ── Pending buy/sell price lines ─────────────────────────────────────────────
   useEffect(() => {
@@ -662,11 +683,11 @@ function CandlestickChart({
     if (typeof pivotHighPrice === "number" && Number.isFinite(pivotHighPrice)) {
       pivotHighLineRef.current = cs.createPriceLine({
         price: pivotHighPrice,
-        color: "#9aa3b8",
+        color: "#017322",
         lineWidth: 1,
         lineStyle: LineStyle.Solid,
-        axisLabelVisible: true,
-        title: "Pivot High",
+        axisLabelVisible: false,
+        title: "PivHigh",
       });
     }
 
@@ -677,11 +698,11 @@ function CandlestickChart({
     if (typeof pivotLowPrice === "number" && Number.isFinite(pivotLowPrice)) {
       pivotLowLineRef.current = cs.createPriceLine({
         price: pivotLowPrice,
-        color: "#6b7280",
-        lineWidth: 1,
+        color: "#C10C16",
+        lineWidth: 2,
         lineStyle: LineStyle.Solid,
-        axisLabelVisible: true,
-        title: "Pivot Low",
+        axisLabelVisible: false,
+        title: "PivLow",
       });
     }
 
@@ -1613,29 +1634,32 @@ export default function App() {
   const pendingLevels = useMemo(() => {
     const s = STRATEGY_MAP[selectedStrategyId];
     if (!s.getPendingLevels || !candles.length) return { buy: null, sell: null };
-    // PRP dùng cùng mảng candle với backtest (có cả live)
+    // PRP không show pending buy sell
     if (s.id === "prp-pivot-psar") {
-      const allCandles = liveCandleForBacktest ? [...candles, liveCandleForBacktest] : candles;
-      return s.getPendingLevels(allCandles, strategyParams);
+      return { buy: null, sell: null };
     }
     // Các strategy khác vẫn dùng chỉ closed candles
     return s.getPendingLevels(candles, strategyParams);
   }, [selectedStrategyId, strategyParams, candles, liveCandleForBacktest]);
-
   const pivotLevels = useMemo(() => {
     const strategy = STRATEGY_MAP[selectedStrategyId];
-    if (!strategy?.getCurrentPivots) return { pivotHigh: null, pivotLow: null };
+    if (!strategy?.getCurrentPivots) {
+      return { pivotHigh: null, pivotLow: null, pivotHighTime: null, pivotLowTime: null };
+    }
     const candlesForPivots = strategy.id === "prp-pivot-psar" && liveCandleForBacktest
       ? [...candles, liveCandleForBacktest]
       : candles;
-    if (!candlesForPivots.length) return { pivotHigh: null, pivotLow: null };
+    if (!candlesForPivots.length) {
+      return { pivotHigh: null, pivotLow: null, pivotHighTime: null, pivotLowTime: null };
+    }
     const out = strategy.getCurrentPivots(candlesForPivots, strategyParams);
     return {
       pivotHigh: typeof out.pivotHigh === "number" && Number.isFinite(out.pivotHigh) ? out.pivotHigh : null,
       pivotLow:  typeof out.pivotLow === "number"  && Number.isFinite(out.pivotLow)  ? out.pivotLow : null,
+      pivotHighTime: typeof out.pivotHighTime === "number" && Number.isFinite(out.pivotHighTime) ? out.pivotHighTime : null,
+      pivotLowTime: typeof out.pivotLowTime === "number" && Number.isFinite(out.pivotLowTime) ? out.pivotLowTime : null,
     };
   }, [selectedStrategyId, strategyParams, candles, liveCandleForBacktest]);
-
   const activeExitLevels = useMemo(() => {
     const strategy = STRATEGY_MAP[selectedStrategyId];
     if (!strategy || !strategy.getActiveExitLevels) return { stopLoss: null, takeProfit: null };
@@ -1721,6 +1745,8 @@ export default function App() {
           activeTakeProfit={activeExitLevels.takeProfit}
           pivotHighPrice={pivotLevels.pivotHigh}
           pivotLowPrice={pivotLevels.pivotLow}
+          pivotHighTime={pivotLevels.pivotHighTime}
+          pivotLowTime={pivotLevels.pivotLowTime}
         />
       </div>
 

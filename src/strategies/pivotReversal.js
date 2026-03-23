@@ -194,4 +194,35 @@ export const PivotReversalStrategy = {
       sell: se && lprice > 0 ? lprice - TICK : null,
     };
   },
+
+  // Current swing pivots and their source candle time (for chart lines/markers)
+  getCurrentPivots(candles, { leftBars, rightBars }) {
+    if (!candles.length) return { pivotHigh: null, pivotLow: null, pivotHighTime: null, pivotLowTime: null };
+    let hprice = 0;
+    let lprice = 0;
+    let pivotHighTime = null;
+    let pivotLowTime = null;
+
+    for (let i = 0; i < candles.length; i++) {
+      const swh = getPivotHigh(candles, i, leftBars, rightBars);
+      const swl = getPivotLow(candles, i, leftBars, rightBars);
+      if (swh !== null) {
+        hprice = swh;
+        const pivotIdx = i - rightBars;
+        pivotHighTime = pivotIdx >= 0 ? candles[pivotIdx]?.time ?? null : null;
+      }
+      if (swl !== null) {
+        lprice = swl;
+        const pivotIdx = i - rightBars;
+        pivotLowTime = pivotIdx >= 0 ? candles[pivotIdx]?.time ?? null : null;
+      }
+    }
+
+    return {
+      pivotHigh: hprice > 0 ? hprice : null,
+      pivotLow: lprice > 0 ? lprice : null,
+      pivotHighTime: typeof pivotHighTime === "number" ? pivotHighTime : null,
+      pivotLowTime: typeof pivotLowTime === "number" ? pivotLowTime : null,
+    };
+  },
 };

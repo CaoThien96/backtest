@@ -371,7 +371,7 @@ export const PrpPivotPsarStrategy = {
               time: bar.time,
               timestamp: bar.timestamp,
               type: "long",
-              label: "PRP Long",
+              label: "LE",
               entryPrice,
               stopLevel: hprice,
               exitFn: makeExitFn("long", entryPrice),
@@ -388,7 +388,7 @@ export const PrpPivotPsarStrategy = {
               time: bar.time,
               timestamp: bar.timestamp,
               type: "short",
-              label: "PRP Short",
+              label: "SE",
               entryPrice,
               stopLevel: lprice,
               exitFn: makeExitFn("short", entryPrice),
@@ -560,18 +560,30 @@ export const PrpPivotPsarStrategy = {
   getCurrentPivots(candles, {
     leftBars, rightBars,
   }) {
-    if (!candles.length) return { pivotHigh: null, pivotLow: null };
+    if (!candles.length) return { pivotHigh: null, pivotLow: null, pivotHighTime: null, pivotLowTime: null };
     let hprice = 0;
     let lprice = 0;
+    let pivotHighTime = null;
+    let pivotLowTime = null;
     for (let i = 0; i < candles.length; i++) {
       const swh = getPivotHigh(candles, i, leftBars, rightBars);
       const swl = getPivotLow(candles, i, leftBars, rightBars);
-      if (swh !== null) hprice = swh;
-      if (swl !== null) lprice = swl;
+      if (swh !== null) {
+        hprice = swh;
+        const pivotIdx = i - rightBars;
+        pivotHighTime = pivotIdx >= 0 ? candles[pivotIdx]?.time ?? null : null;
+      }
+      if (swl !== null) {
+        lprice = swl;
+        const pivotIdx = i - rightBars;
+        pivotLowTime = pivotIdx >= 0 ? candles[pivotIdx]?.time ?? null : null;
+      }
     }
     return {
       pivotHigh: hprice > 0 ? hprice : null,
       pivotLow:  lprice > 0 ? lprice : null,
+      pivotHighTime: typeof pivotHighTime === "number" ? pivotHighTime : null,
+      pivotLowTime: typeof pivotLowTime === "number" ? pivotLowTime : null,
     };
   },
 };
