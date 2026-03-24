@@ -8,8 +8,8 @@ import { ChannelBreakoutStrategy } from "./channelBreakout";
 import { MomentumStrategy }        from "./momentum";
 
 export const STRATEGIES = [
-  PivotReversalStrategy,
   PrpPivotPsarStrategy,
+  PivotReversalStrategy,
   ChannelBreakoutStrategy,
   MomentumStrategy,
 ];

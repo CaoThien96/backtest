@@ -60,6 +60,135 @@ function formatPnL(val, percent) {
   return `${sign}${formatPrice(val)} (${sign}${percent?.toFixed(2)}%)`;
 }
 
+function intervalToMinutes(interval) {
+  if (interval === "D") return 1440;
+  const n = Number(interval);
+  return Number.isFinite(n) && n > 0 ? n : 15;
+}
+
+function calcDynamicRvolForMinuteRows(minuteCandles, timeframeCandles, entryStartMs, lookback) {
+  if (!lookback || lookback <= 0 || !minuteCandles.length || !timeframeCandles.length) {
+    return new Array(minuteCandles.length).fill(null);
+  }
+
+  const prevTfBars = timeframeCandles
+    .filter((c) => c?.timestamp < entryStartMs)
+    .sort((a, b) => a.time - b.time);
+  if (prevTfBars.length < lookback) return new Array(minuteCandles.length).fill(null);
+
+  const base = prevTfBars.slice(-lookback);
+  const avgVol = base.reduce((s, c) => s + (c?.volume ?? 0), 0) / lookback;
+  if (!(avgVol > 0)) return new Array(minuteCandles.length).fill(null);
+
+  const out = new Array(minuteCandles.length).fill(null);
+  let cumVol = 0;
+  for (let i = 0; i < minuteCandles.length; i++) {
+    cumVol += minuteCandles[i]?.volume ?? 0;
+    out[i] = cumVol / avgVol;
+  }
+  return out;
+}
+
+function sortAndClipCandlesInRange(candles, startMs, endMs) {
+  const sorted = [...candles]
+    .filter((c) => c?.timestamp >= startMs && c?.timestamp < endMs)
+    .sort((a, b) => a.time - b.time);
+  const seen = new Set();
+  return sorted.filter((c) => {
+    if (seen.has(c.time)) return false;
+    seen.add(c.time);
+    return true;
+  });
+}
+
+async function fetchBybitMinuteRange(startMs, endMs, symbol = "BTCUSDT") {
+  const endInclusive = endMs - 1;
+  const url = `https://api.bybit.com/v5/market/kline?symbol=${encodeURIComponent(symbol)}&category=linear&interval=1&limit=1000&start=${startMs}&end=${endInclusive}`;
+  const res = await window.fetch(url);
+  const data = await res.json();
+  if (data.retCode !== 0) throw new Error(data.retMsg || "Bybit API error");
+  const list = data.result?.list ?? [];
+  const normalized = [...list].reverse().map((c) => ({
+    timestamp: parseInt(c[0], 10),
+    time: Math.floor(parseInt(c[0], 10) / 1000),
+    open: parseFloat(c[1]),
+    high: parseFloat(c[2]),
+    low: parseFloat(c[3]),
+    close: parseFloat(c[4]),
+    volume: parseFloat(c[5] ?? 0),
+  }));
+  return sortAndClipCandlesInRange(normalized, startMs, endMs);
+}
+
+async function fetchMinuteRangeByProvider(providerId, startMs, endMs) {
+  if (providerId === "coinbase") {
+    const start = new Date(startMs).toISOString();
+    const end = new Date(endMs - 1).toISOString();
+    const url = `https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
+    const res = await window.fetch(url);
+    if (!res.ok) throw new Error(`Coinbase API: ${res.status}`);
+    const list = await res.json();
+    const normalized = Array.isArray(list)
+      ? [...list].reverse().map((c) => ({
+          timestamp: parseInt(c[0], 10) * 1000,
+          time: parseInt(c[0], 10),
+          open: parseFloat(c[3]),
+          high: parseFloat(c[2]),
+          low: parseFloat(c[1]),
+          close: parseFloat(c[4]),
+          volume: parseFloat(c[5] ?? 0),
+        }))
+      : [];
+    return sortAndClipCandlesInRange(normalized, startMs, endMs);
+  }
+  if (providerId === "bitstamp") {
+    const startSec = Math.floor(startMs / 1000);
+    const endSec = Math.floor((endMs - 1) / 1000);
+    const url = `https://www.bitstamp.net/api/v2/ohlc/btcusd/?step=60&limit=1000&start=${startSec}&end=${endSec}`;
+    const res = await window.fetch(url);
+    if (!res.ok) throw new Error(`Bitstamp API: ${res.status}`);
+    const data = await res.json();
+    const ohlc = data?.data?.ohlc ?? [];
+    const normalized = ohlc.map((c) => {
+      const t = parseInt(c.timestamp, 10);
+      return {
+        timestamp: t * 1000,
+        time: t,
+        open: parseFloat(c.open),
+        high: parseFloat(c.high),
+        low: parseFloat(c.low),
+        close: parseFloat(c.close),
+        volume: parseFloat(c.volume ?? 0),
+      };
+    });
+    return sortAndClipCandlesInRange(normalized, startMs, endMs);
+  }
+  if (providerId === "kraken") {
+    const sinceSec = Math.floor(startMs / 1000);
+    const url = `https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=1&since=${sinceSec}`;
+    const res = await window.fetch(url);
+    const data = await res.json();
+    if (data.error && data.error.length) throw new Error(data.error.join(" ") || "Kraken API error");
+    const result = data.result ?? {};
+    const key = Object.keys(result).find((k) => k !== "last");
+    const rows = key ? result[key] ?? [] : [];
+    const normalized = rows.map((c) => {
+      const t = parseInt(c[0], 10);
+      return {
+        timestamp: t * 1000,
+        time: t,
+        open: parseFloat(c[1]),
+        high: parseFloat(c[2]),
+        low: parseFloat(c[3]),
+        close: parseFloat(c[4]),
+        volume: parseFloat(c[6] ?? 0),
+      };
+    });
+    return sortAndClipCandlesInRange(normalized, startMs, endMs);
+  }
+  return [];
+}
+
 // ─── Hook: throttle a value (max 1 update per `delay` ms) ────────────────────
 function useThrottle(value, delay) {
   const [throttled, setThrottled] = useState(value);
@@ -135,7 +264,12 @@ function useCandleData(providerId = DEFAULT_PROVIDER_ID, interval = "15") {
     }
     if (fromCache.length > 0) {
       const range = getCachedRange(providerId, interval);
-      hasMoreRef.current = range != null && range.from < fromCache[0].time;
+      // Cache range only tells what we have locally, not what exists remotely.
+      // Do not set hasMore=false here, otherwise we can block the API fetch
+      // once we hit the oldest cached candle.
+      if (range != null && range.from < fromCache[0].time) {
+        hasMoreRef.current = true;
+      }
       setCandles((prev) => {
         const prevOldest = prev.length > 0 ? prev[0].time : Infinity;
         const filtered = fromCache.filter((c) => c.time < prevOldest);
@@ -422,6 +556,7 @@ function CandlestickChart({
   pivotLowPrice,
   pivotHighTime,
   pivotLowTime,
+  currentRvol,
 }) {
   const containerRef = useRef(null);
   const chartRef = useRef(null);
@@ -447,7 +582,7 @@ function CandlestickChart({
   useEffect(() => { fetchMoreRef.current = fetchMore; }, [fetchMore]);
   useEffect(() => { liveCandleRef.current = liveCandle; }, [liveCandle]);
 
-  const [hoveredBar, setHoveredBar] = useState(null);
+  const [hoveredTime, setHoveredTime] = useState(null);
   const [activeTimeframe, setActiveTimeframe] = useState("5D");
 
   // ── Init chart một lần ──────────────────────────────────────────────────────
@@ -486,10 +621,10 @@ function CandlestickChart({
 
     chart.subscribeCrosshairMove((param) => {
       if (param.time) {
-        const bar = param.seriesData?.get(candleSeries);
-        if (bar) setHoveredBar(bar);
+        const t = typeof param.time === "number" ? param.time : null;
+        setHoveredTime(t);
       } else {
-        setHoveredBar(null);
+        setHoveredTime(null);
       }
     });
 
@@ -550,7 +685,9 @@ function CandlestickChart({
       color: THEME.textSecondary,
       lineWidth: 1,
       lineStyle: LineStyle.Dashed,
-      axisLabelVisible: true,
+      // Disable axis label here to avoid duplicating the candle series last-value label
+      // (which is shown with green/red depending on candle direction).
+      axisLabelVisible: false,
     });
 
     if (isFirstDataRef.current && chart) {
@@ -583,7 +720,7 @@ function CandlestickChart({
         color: THEME.textSecondary,
         lineWidth: 1,
         lineStyle: LineStyle.Dashed,
-        axisLabelVisible: true,
+        axisLabelVisible: false,
       });
     }
   }, [liveCandle]);
@@ -605,7 +742,7 @@ function CandlestickChart({
       markers.push({
         time: pivotHighTime,
         position: "aboveBar",
-        color: "#017322",
+        color: "#E9A23B",
         shape: "circle",
         text: "ph",
       });
@@ -614,7 +751,7 @@ function CandlestickChart({
       markers.push({
         time: pivotLowTime,
         position: "belowBar",
-        color: "#C10C16",
+        color: "#5FA8FF",
         shape: "circle",
         text: "pl",
       });
@@ -669,7 +806,7 @@ function CandlestickChart({
         pendingSellLineRef.current = null;
       }
     };
-  }, [pendingBuy, pendingSell]);
+  }, [pendingBuy, pendingSell, pivotHighPrice, pivotLowPrice]);
 
   // ── Pivot High / Pivot Low lines (current swing pivots) ───────────────────────
   useEffect(() => {
@@ -683,11 +820,11 @@ function CandlestickChart({
     if (typeof pivotHighPrice === "number" && Number.isFinite(pivotHighPrice)) {
       pivotHighLineRef.current = cs.createPriceLine({
         price: pivotHighPrice,
-        color: "#017322",
-        lineWidth: 1,
+        color: "#E9A23B",
+        lineWidth: 0.5,
         lineStyle: LineStyle.Solid,
-        axisLabelVisible: false,
-        title: "PivHigh",
+        axisLabelVisible: true,
+        title: ``,
       });
     }
 
@@ -698,11 +835,11 @@ function CandlestickChart({
     if (typeof pivotLowPrice === "number" && Number.isFinite(pivotLowPrice)) {
       pivotLowLineRef.current = cs.createPriceLine({
         price: pivotLowPrice,
-        color: "#C10C16",
-        lineWidth: 2,
+        color: "#5FA8FF",
+        lineWidth: 0.5,
         lineStyle: LineStyle.Solid,
-        axisLabelVisible: false,
-        title: "PivLow",
+        axisLabelVisible: true,
+        title: "",
       });
     }
 
@@ -827,9 +964,20 @@ function CandlestickChart({
     chart.timeScale().setVisibleRange({ from: fromSec, to: nowSec });
   }, [candles]);
 
-  const displayBar = hoveredBar ?? (candles.length > 0 ? candles[candles.length - 1] : null);
+  const candleByTime = useMemo(() => {
+    const map = new Map();
+    for (const c of candles) map.set(c.time, c);
+    return map;
+  }, [candles]);
+
+  const hoveredCandle = hoveredTime != null ? candleByTime.get(hoveredTime) ?? null : null;
+  const displayBar = hoveredCandle ?? liveCandle ?? (candles.length > 0 ? candles[candles.length - 1] : null);
   const barUp = displayBar ? displayBar.close >= displayBar.open : true;
   const barColor = barUp ? THEME.green : THEME.red;
+  const rvolText =
+    typeof currentRvol === "number" && Number.isFinite(currentRvol)
+      ? ` · RVOL ${currentRvol.toFixed(2)}`
+      : "";
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", background: THEME.bgPrimary }}>
@@ -844,7 +992,7 @@ function CandlestickChart({
             <option key={p.id} value={p.id}>{p.name}</option>
           ))}
         </select>
-        <span style={{ color: THEME.textPrimary, fontWeight: 700, fontSize: 13 }}>{symbolLabel} · {INTERVALS.find((i) => i.value === selectedInterval)?.label ?? selectedInterval}</span>
+        <span style={{ color: THEME.textPrimary, fontWeight: 700, fontSize: 13 }}>{symbolLabel} · {INTERVALS.find((i) => i.value === selectedInterval)?.label ?? selectedInterval}{rvolText}</span>
         {displayBar && (
           <div style={{ display: "flex", gap: 10, fontSize: 12, fontFamily: "'Source Code Pro', monospace" }}>
             {[["O", displayBar.open], ["H", displayBar.high], ["L", displayBar.low], ["C", displayBar.close]].map(([label, val]) => (
@@ -909,7 +1057,7 @@ function CandlestickChart({
 }
 
 // ─── Component: TradeTable ────────────────────────────────────────────────────
-function TradeTable({ trades }) {
+function TradeTable({ trades, onTradeSelect, selectedTradeNumber }) {
   if (trades.length === 0) {
     return (
       <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: THEME.textSecondary, fontSize: 13 }}>
@@ -953,10 +1101,15 @@ function TradeTable({ trades }) {
             const rowBg = THEME.bgPrimary;
             const rowBgAlt = `${THEME.bgSecondary}88`;
 
+            const selected = selectedTradeNumber === trade.tradeNumber;
             return (
               <>
                 {/* Row 1: Exit */}
-                <tr key={`${trade.tradeNumber}-exit`} style={{ background: rowBgAlt, borderTop: `1px solid ${THEME.border}` }}>
+                <tr
+                  key={`${trade.tradeNumber}-exit`}
+                  onClick={() => onTradeSelect?.(trade)}
+                  style={{ background: selected ? `${THEME.blue}22` : rowBgAlt, borderTop: `1px solid ${THEME.border}`, cursor: "pointer" }}
+                >
                   <td style={{ ...colStyle, verticalAlign: "middle" }} rowSpan={2}>
                     <div style={{ fontWeight: 600, color: THEME.textPrimary, fontSize: 12 }}>#{trade.tradeNumber}</div>
                     <div style={{ color: badgeColor, fontSize: 10, fontWeight: 600 }}>{trade.type.toUpperCase()}</div>
@@ -997,7 +1150,11 @@ function TradeTable({ trades }) {
                 </tr>
 
                 {/* Row 2: Entry */}
-                <tr key={`${trade.tradeNumber}-entry`} style={{ background: rowBg }}>
+                <tr
+                  key={`${trade.tradeNumber}-entry`}
+                  onClick={() => onTradeSelect?.(trade)}
+                  style={{ background: selected ? `${THEME.blue}18` : rowBg, cursor: "pointer" }}
+                >
                   <td style={{ ...colStyle, color: THEME.textSecondary }}>Entry</td>
                   <td style={{ ...colStyle, color: THEME.textPrimary }}>{formatDateTime(trade.entryTimestamp)}</td>
                   <td style={{ ...colStyle, color: THEME.textSecondary }}>{trade.entrySignal}</td>
@@ -1008,6 +1165,88 @@ function TradeTable({ trades }) {
               </>
             );
           })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function MinuteSimulationTable({ selectedTrade, rows, loading, error, sourceLabel, windowStartMs, windowEndMs, onClose }) {
+  const panelStyle = {
+    borderTop: `1px solid ${THEME.border}`,
+    background: THEME.bgSecondary,
+    padding: "8px 10px",
+    maxHeight: 220,
+    overflow: "auto",
+  };
+
+  if (!selectedTrade) {
+    return <div style={{ ...panelStyle, color: THEME.textSecondary, fontSize: 12 }}>Click a trade to view minute-level open simulation.</div>;
+  }
+  if (loading) {
+    return <div style={{ ...panelStyle, color: THEME.textSecondary, fontSize: 12 }}>Loading minute simulation...</div>;
+  }
+  if (error) {
+    return <div style={{ ...panelStyle, color: THEME.red, fontSize: 12 }}>Simulation error: {error}</div>;
+  }
+
+  return (
+    <div style={panelStyle}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 8, fontSize: 11 }}>
+        <span style={{ color: THEME.textPrimary, fontWeight: 600 }}>
+          Trade #{selectedTrade.tradeNumber} ({selectedTrade.type}) minute replay
+        </span>
+        <span style={{ color: THEME.textSecondary, display: "flex", alignItems: "center", gap: 10 }}>
+          <span>
+            {formatDateTime(windowStartMs)} - {formatDateTime(windowEndMs)} · Source: {sourceLabel ?? "—"}
+          </span>
+          {onClose && (
+            <button
+              onClick={onClose}
+              style={{
+                padding: "2px 8px",
+                fontSize: 12,
+                background: THEME.bgTertiary,
+                color: THEME.textSecondary,
+                border: `1px solid ${THEME.border}`,
+                borderRadius: 4,
+                cursor: "pointer",
+                fontFamily: "inherit",
+                lineHeight: 1.2,
+              }}
+              aria-label="Close minute simulation panel"
+              title="Hide"
+            >
+              x
+            </button>
+          )}
+        </span>
+      </div>
+      <table style={{ width: "100%", borderCollapse: "collapse", tableLayout: "fixed" }}>
+        <thead>
+          <tr>
+            {["Time", "Current Price", "RVol", "Stop Sell At", "Stop Buy At"].map((h) => (
+              <th key={h} style={{ textAlign: "left", fontSize: 11, padding: "5px 8px", color: THEME.textSecondary, borderBottom: `1px solid ${THEME.border}` }}>{h}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.length === 0 && (
+            <tr>
+              <td colSpan={5} style={{ padding: "8px", color: THEME.textSecondary, fontSize: 12 }}>
+                No minute candles available in selected window.
+              </td>
+            </tr>
+          )}
+          {rows.map((r) => (
+            <tr key={r.timeMs}>
+              <td style={{ padding: "4px 8px", fontSize: 11, color: THEME.textPrimary }}>{formatDateTime(r.timeMs)}</td>
+              <td style={{ padding: "4px 8px", fontSize: 11, color: THEME.textPrimary }}>{formatPrice(r.currentPrice)}</td>
+              <td style={{ padding: "4px 8px", fontSize: 11, color: THEME.textPrimary }}>{r.rvol == null ? "—" : r.rvol.toFixed(2)}</td>
+              <td style={{ padding: "4px 8px", fontSize: 11, color: THEME.red }}>{r.stopSellAt == null ? "—" : formatPrice(r.stopSellAt)}</td>
+              <td style={{ padding: "4px 8px", fontSize: 11, color: THEME.green }}>{r.stopBuyAt == null ? "—" : formatPrice(r.stopBuyAt)}</td>
+            </tr>
+          ))}
         </tbody>
       </table>
     </div>
@@ -1326,7 +1565,7 @@ function MetricsTab({ trades }) {
 }
 
 // ─── Component: StrategyReport ────────────────────────────────────────────────
-function StrategyReport({ trades, strategyName }) {
+function StrategyReport({ trades, strategyName, onTradeSelect, selectedTradeNumber, detailPanel }) {
   const [activeTab, setActiveTab] = useState("trades");
 
   const winTrades = trades.filter((t) => !t.isOpen && t.netPnL > 0).length;
@@ -1398,7 +1637,14 @@ function StrategyReport({ trades, strategyName }) {
 
       {/* Tab content */}
       <div style={{ flex: 1, overflow: "hidden" }}>
-        {activeTab === "trades" && <TradeTable trades={trades} />}
+        {activeTab === "trades" && (
+          <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+            <div style={{ flex: 1, minHeight: 0 }}>
+              <TradeTable trades={trades} onTradeSelect={onTradeSelect} selectedTradeNumber={selectedTradeNumber} />
+            </div>
+            {detailPanel}
+          </div>
+        )}
         {activeTab === "metrics" && <MetricsTab trades={trades} />}
       </div>
     </div>
@@ -1566,6 +1812,15 @@ export default function App() {
   const [minFePct, setMinFePct]         = useState(1); // min FE% of position to activate trail
   const [partialThresholdPct, setPartialThresholdPct] = useState(0);
   const [partialCloseRatioPct, setPartialCloseRatioPct] = useState(50);
+  const [selectedTradeForDetail, setSelectedTradeForDetail] = useState(null);
+  const [minuteDetailVisible, setMinuteDetailVisible] = useState(true);
+  const [minuteDetailRows, setMinuteDetailRows] = useState([]);
+  const [minuteDetailLoading, setMinuteDetailLoading] = useState(false);
+  const [minuteDetailError, setMinuteDetailError] = useState(null);
+  const [minuteDetailSource, setMinuteDetailSource] = useState(null);
+  const [minuteDetailWindow, setMinuteDetailWindow] = useState({ startMs: null, endMs: null });
+  const minuteDetailCacheRef = useRef(new Map());
+  const minuteDetailReqRef = useRef(0);
 
   // Cập nhật params khi đổi strategy
   const handleStrategyChange = (id) => {
@@ -1630,6 +1885,162 @@ export default function App() {
 
     return trades;
   }, [trades, partialEnabled, partialThresholdPct, partialCloseRatioPct, trailEnabled, trailPct, minFePct, candles, liveCandleForBacktest]);
+
+  useEffect(() => {
+    if (!selectedTradeForDetail) {
+      setMinuteDetailRows([]);
+      setMinuteDetailError(null);
+      setMinuteDetailLoading(false);
+      setMinuteDetailSource(null);
+      return;
+    }
+    setMinuteDetailVisible(true);
+
+    const strategy = STRATEGY_MAP[selectedStrategyId];
+    const timeframeMin = intervalToMinutes(selectedInterval);
+    const windowStartMs = selectedTradeForDetail.entryTimestamp;
+    const windowEndMs = windowStartMs + timeframeMin * 60 * 1000;
+    const tfMs = timeframeMin * 60 * 1000;
+    setMinuteDetailWindow({ startMs: windowStartMs, endMs: windowEndMs });
+
+    const cacheKey = [
+      selectedProviderId,
+      symbolLabel,
+      selectedInterval,
+      selectedStrategyId,
+      selectedTradeForDetail.tradeNumber,
+      selectedTradeForDetail.entryTimestamp,
+      JSON.stringify(strategyParams),
+    ].join("|");
+
+    const cached = minuteDetailCacheRef.current.get(cacheKey);
+    if (cached) {
+      setMinuteDetailRows(cached.rows);
+      setMinuteDetailSource(cached.source);
+      setMinuteDetailError(null);
+      setMinuteDetailLoading(false);
+      return;
+    }
+
+    const reqId = ++minuteDetailReqRef.current;
+    setMinuteDetailLoading(true);
+    setMinuteDetailError(null);
+
+    (async () => {
+      let minuteCandlesAll = [];
+      let source = selectedProviderId;
+
+      const leftBars = Number(strategyParams.leftBars ?? 0);
+      const rightBars = Number(strategyParams.rightBars ?? 0);
+      const filterMode = strategyParams.filterMode ?? null;
+      const useRvolFilter = filterMode === "RVOL";
+      const useMfiFilter = filterMode === "MFI";
+      const rvolLookback = Number(strategyParams.rvolLookback ?? 0);
+      const mfiLength = Number(strategyParams.mfiLength ?? 0);
+
+      const bufferTfBars = Math.max(
+        leftBars + rightBars + 5,
+        useRvolFilter ? rvolLookback + 5 : 0,
+        useMfiFilter ? mfiLength + 5 : 0
+      );
+
+      // Keep total fetch <= 1000 minutes because current REST helpers don't paginate.
+      const maxFetchMinutes = 1000;
+      const maxStateStartMs = windowEndMs - maxFetchMinutes * 60 * 1000;
+      const desiredStateStartMs = windowStartMs - bufferTfBars * tfMs;
+      const stateStartMs = Math.max(desiredStateStartMs, maxStateStartMs);
+
+      try {
+        minuteCandlesAll = await fetchMinuteRangeByProvider(selectedProviderId, stateStartMs, windowEndMs);
+      } catch {
+        minuteCandlesAll = [];
+      }
+      if (minuteCandlesAll.length === 0) {
+        source = "bybit";
+        minuteCandlesAll = await fetchBybitMinuteRange(stateStartMs, windowEndMs, "BTCUSDT");
+      }
+
+      const minuteCandles = minuteCandlesAll.filter((c) => c.timestamp >= windowStartMs && c.timestamp < windowEndMs);
+      if (minuteCandles.length === 0) {
+        if (reqId !== minuteDetailReqRef.current) return;
+        minuteDetailCacheRef.current.set(cacheKey, { rows: [], source });
+        setMinuteDetailRows([]);
+        setMinuteDetailSource(source);
+        setMinuteDetailLoading(false);
+        return;
+      }
+
+      const stateOffset = minuteCandlesAll.findIndex((c) => c.timestamp >= windowStartMs);
+      const offset = stateOffset >= 0 ? stateOffset : 0;
+
+      const aggregateMinutesToTimeframeCandles = (minutes) => {
+        const map = new Map(); // bucketStartMs -> candle
+        for (const m of minutes) {
+          const bucketStart = Math.floor(m.timestamp / tfMs) * tfMs;
+          if (!map.has(bucketStart)) {
+            map.set(bucketStart, {
+              timestamp: bucketStart,
+              time: Math.floor(bucketStart / 1000),
+              open: m.open,
+              high: m.high,
+              low: m.low,
+              close: m.close,
+              volume: m.volume ?? 0,
+            });
+          } else {
+            const cur = map.get(bucketStart);
+            cur.high = Math.max(cur.high, m.high);
+            cur.low = Math.min(cur.low, m.low);
+            cur.close = m.close;
+            cur.volume += m.volume ?? 0;
+          }
+        }
+        return [...map.values()].sort((a, b) => a.time - b.time);
+      };
+
+      const useRvol = Object.prototype.hasOwnProperty.call(strategyParams, "rvolLookback");
+      const lookback = Number(strategyParams.rvolLookback ?? 0);
+      const timeframeCandles = [...candles].sort((a, b) => a.time - b.time);
+      const dynamicRvolArr = useRvol
+        ? calcDynamicRvolForMinuteRows(minuteCandles, timeframeCandles, windowStartMs, lookback)
+        : new Array(minuteCandles.length).fill(null);
+
+      const rows = minuteCandles.map((c, i) => {
+        const absIdx = offset + i;
+        // Pending levels / pivots should be based on fully closed timeframe candles.
+        // For a minute inside bucket [bucketStart, bucketStart+tfMs), the "current" candle
+        // is still forming, so we exclude it by only using minutes < bucketStart.
+        const bucketStartMs = Math.floor(c.timestamp / tfMs) * tfMs;
+        const minutePrefixClosed = minuteCandlesAll
+          .slice(0, absIdx + 1)
+          .filter((m) => m.timestamp < bucketStartMs);
+        const tfPrefixCandles = aggregateMinutesToTimeframeCandles(minutePrefixClosed);
+        const pending = strategy?.getPendingLevels
+          ? strategy.getPendingLevels(tfPrefixCandles, strategyParams)
+          : { buy: null, sell: null };
+        const rvol = dynamicRvolArr[i];
+        return {
+          timeMs: c.timestamp,
+          currentPrice: c.close,
+          rvol,
+          stopSellAt: typeof pending.sell === "number" && Number.isFinite(pending.sell) ? pending.sell : null,
+          stopBuyAt: typeof pending.buy === "number" && Number.isFinite(pending.buy) ? pending.buy : null,
+        };
+      });
+
+      if (reqId !== minuteDetailReqRef.current) return;
+      minuteDetailCacheRef.current.set(cacheKey, { rows, source });
+      setMinuteDetailRows(rows);
+      setMinuteDetailSource(source);
+      setMinuteDetailLoading(false);
+    })().catch((err) => {
+      if (reqId !== minuteDetailReqRef.current) return;
+      setMinuteDetailError(err?.message ?? "Failed to simulate minute details");
+      setMinuteDetailRows([]);
+      setMinuteDetailSource(null);
+      setMinuteDetailLoading(false);
+    });
+  }, [selectedTradeForDetail, selectedProviderId, symbolLabel, selectedInterval, selectedStrategyId, strategyParams]);
 
   const pendingLevels = useMemo(() => {
     const s = STRATEGY_MAP[selectedStrategyId];
@@ -1696,6 +2107,15 @@ export default function App() {
     };
   }, [selectedStrategyId, strategyParams, candles, liveCandleForBacktest, trades, pendingLevels]);
 
+  const currentRvol = useMemo(() => {
+    const strategy = STRATEGY_MAP[selectedStrategyId];
+    if (!strategy?.getCurrentRvol) return null;
+    const candlesForRvol = strategy.id === "prp-pivot-psar" && liveCandleForBacktest
+      ? [...candles, liveCandleForBacktest]
+      : candles;
+    return strategy.getCurrentRvol(candlesForRvol, strategyParams);
+  }, [selectedStrategyId, strategyParams, candles, liveCandleForBacktest]);
+
   if (loading) return <Loading />;
   if (error) return <ErrorState message={error} onRetry={refetch} />;
 
@@ -1747,12 +2167,32 @@ export default function App() {
           pivotLowPrice={pivotLevels.pivotLow}
           pivotHighTime={pivotLevels.pivotHighTime}
           pivotLowTime={pivotLevels.pivotLowTime}
+          currentRvol={currentRvol}
         />
       </div>
 
       {/* Strategy report — 40% height */}
       <div style={{ flex: "0 0 40%", overflow: "hidden" }}>
-        <StrategyReport trades={displayTrades} strategyName={strategy.name} />
+        <StrategyReport
+          trades={displayTrades}
+          strategyName={strategy.name}
+          onTradeSelect={setSelectedTradeForDetail}
+          selectedTradeNumber={selectedTradeForDetail?.tradeNumber ?? null}
+          detailPanel={
+            minuteDetailVisible ? (
+              <MinuteSimulationTable
+                selectedTrade={selectedTradeForDetail}
+                rows={minuteDetailRows}
+                loading={minuteDetailLoading}
+                error={minuteDetailError}
+                sourceLabel={minuteDetailSource}
+                windowStartMs={minuteDetailWindow.startMs}
+                windowEndMs={minuteDetailWindow.endMs}
+                onClose={() => setMinuteDetailVisible(false)}
+              />
+            ) : null
+          }
+        />
       </div>
     </div>
   );

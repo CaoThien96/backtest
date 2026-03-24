@@ -238,7 +238,7 @@ export const PrpPivotPsarStrategy = {
     atrPeriod: { type: "number", label: "ATR Period", default: 14, min: 1, max: 100 },
     slMultiplier: { type: "number", label: "SL ATR Mult", default: 8.8, min: 0.1, max: 20, step: 0.1 },
     tpMultiplier: { type: "number", label: "TP ATR Mult", default: 8.8, min: 0.1, max: 50, step: 0.1 },
-    useSL: { type: "select", label: "Use SL ATR", default: "Yes", options: ["Yes", "No"] },
+    useSL: { type: "select", label: "Use SL ATR", default: "No", options: ["Yes", "No"] },
     useTP: { type: "select", label: "Use TP ATR", default: "Yes", options: ["Yes", "No"] },
     filterMode: { type: "select", label: "Filter Mode", default: "RVOL", options: ["None", "RVOL", "MFI"] },
     rvolLookback: { type: "number", label: "RVOL Lookback", default: 5, min: 1, max: 200 },
@@ -496,13 +496,17 @@ export const PrpPivotPsarStrategy = {
 
       if (swl !== null) {
         const zoneOk = !zoneFilterEnabled || isNearSupport(lprice, levels, ppLevels, zonePct);
-        if (zoneOk && passesFilter("long", i)) longArmed = true;
+        // RVOL/MFI filter is applied at the actual stop trigger time in generateSignals(),
+        // not at arming time, so we only arm by pivot + zoneOk here.
+        if (zoneOk) longArmed = true;
         else if (longArmed && bar.high > hprice) longArmed = false;
       } else if (longArmed && bar.high > hprice) longArmed = false;
 
       if (swh !== null) {
         const zoneOk = !zoneFilterEnabled || isNearResistance(hprice, levels, ppLevels, zonePct);
-        if (zoneOk && passesFilter("short", i)) shortArmed = true;
+        // RVOL/MFI filter is applied at the actual stop trigger time in generateSignals(),
+        // not at arming time, so we only arm by pivot + zoneOk here.
+        if (zoneOk) shortArmed = true;
         else if (shortArmed && bar.low < lprice) shortArmed = false;
       } else if (shortArmed && bar.low < lprice) shortArmed = false;
     }
@@ -554,6 +558,20 @@ export const PrpPivotPsarStrategy = {
       useSL === "Yes",
       useTP === "Yes"
     );
+  },
+
+  // Current RVOL (latest bar) for visualization in header.
+  // Only meaningful when filterMode is RVOL.
+  getCurrentRvol(candles, {
+    filterMode,
+    rvolLookback,
+  }) {
+    if (!candles?.length) return null;
+    if (filterMode !== "RVOL") return null;
+    const lookback = Number(rvolLookback ?? 0);
+    const rvolArr = computeRvol(candles, lookback);
+    const last = rvolArr?.[rvolArr.length - 1];
+    return typeof last === "number" && Number.isFinite(last) ? last : null;
   },
 
   // Current swing pivots (for chart lines) — based on PRP's pivot detector
