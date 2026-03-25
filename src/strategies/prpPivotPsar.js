@@ -303,6 +303,7 @@ export const PrpPivotPsarStrategy = {
 
     // exitFn factory: closes over indicator arrays + params + entry details
     const makeExitFn = (type, entryPrice) => (bar, barIndex) => {
+      if (!bar) return null;
       const atr = atrArr[barIndex];
       if (!atr) return null;
 

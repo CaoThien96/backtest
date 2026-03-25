@@ -101,6 +101,22 @@ function sortAndClipCandlesInRange(candles, startMs, endMs) {
   });
 }
 
+function mergeCandlesByTime(candles) {
+  const byTime = new Map();
+  for (const c of candles) {
+    if (c && typeof c.time === "number") byTime.set(c.time, c);
+  }
+  return [...byTime.values()].sort((a, b) => a.time - b.time);
+}
+
+function hasDenseMinuteCoverage(candles, startMs, endMs) {
+  const expected = Math.max(0, Math.ceil((endMs - startMs) / 60000));
+  if (expected === 0) return true;
+  if (!candles?.length) return false;
+  // Allow small gaps caused by exchange outages while still preferring cache reuse.
+  return candles.length >= Math.max(1, expected - 2);
+}
+
 async function fetchBybitMinuteRange(startMs, endMs, symbol = "BTCUSDT") {
   const endInclusive = endMs - 1;
   const url = `https://api.bybit.com/v5/market/kline?symbol=${encodeURIComponent(symbol)}&category=linear&interval=1&limit=1000&start=${startMs}&end=${endInclusive}`;
@@ -120,7 +136,10 @@ async function fetchBybitMinuteRange(startMs, endMs, symbol = "BTCUSDT") {
   return sortAndClipCandlesInRange(normalized, startMs, endMs);
 }
 
-async function fetchMinuteRangeByProvider(providerId, startMs, endMs) {
+async function fetchMinuteRangeByProvider(providerId, startMs, endMs, symbol = "BTCUSDT") {
+  if (providerId === "bybit") {
+    return fetchBybitMinuteRange(startMs, endMs, symbol);
+  }
   if (providerId === "coinbase") {
     const start = new Date(startMs).toISOString();
     const end = new Date(endMs - 1).toISOString();
@@ -189,6 +208,52 @@ async function fetchMinuteRangeByProvider(providerId, startMs, endMs) {
   return [];
 }
 
+async function loadMinuteRangeCached({
+  providerId,
+  symbol,
+  startMs,
+  endMs,
+  inMemoryRef,
+}) {
+  const cacheKey = `${providerId}:${symbol}:1m`;
+  const mergedMemory = inMemoryRef.current.get(cacheKey);
+  if (mergedMemory?.length) {
+    const clipped = sortAndClipCandlesInRange(mergedMemory, startMs, endMs);
+    if (hasDenseMinuteCoverage(clipped, startMs, endMs)) {
+      return { candles: clipped, source: "memory-cache" };
+    }
+  }
+
+  const local = getCandlesFromCache(providerId, "1", symbol);
+  const localClip = sortAndClipCandlesInRange(local, startMs, endMs);
+  if (hasDenseMinuteCoverage(localClip, startMs, endMs)) {
+    inMemoryRef.current.set(cacheKey, mergeCandlesByTime([...(mergedMemory ?? []), ...local]));
+    return { candles: localClip, source: "local-cache" };
+  }
+
+  let fetched = [];
+  let source = providerId;
+  try {
+    fetched = await fetchMinuteRangeByProvider(providerId, startMs, endMs, symbol);
+  } catch {
+    fetched = [];
+  }
+  if (!fetched.length && providerId !== "bybit") {
+    source = "bybit";
+    fetched = await fetchBybitMinuteRange(startMs, endMs, symbol);
+  }
+
+  if (fetched.length) {
+    upsertCandlesInCache(providerId, "1", symbol, fetched);
+    const combined = mergeCandlesByTime([...(mergedMemory ?? []), ...local, ...fetched]);
+    inMemoryRef.current.set(cacheKey, combined);
+    return { candles: sortAndClipCandlesInRange(combined, startMs, endMs), source };
+  }
+
+  const fallback = sortAndClipCandlesInRange([...(mergedMemory ?? []), ...local], startMs, endMs);
+  return { candles: fallback, source: fallback.length ? "cache-partial" : source };
+}
+
 // ─── Hook: throttle a value (max 1 update per `delay` ms) ────────────────────
 function useThrottle(value, delay) {
   const [throttled, setThrottled] = useState(value);
@@ -213,6 +278,7 @@ function useThrottle(value, delay) {
 // ─── Hook: candle data + load more (provider-driven) ──────────────────────────
 function useCandleData(providerId = DEFAULT_PROVIDER_ID, interval = "15") {
   const provider = getProvider(providerId);
+  const symbol = provider?.getSymbol?.() ?? "BTCUSDT";
   const [candles, setCandles] = useState([]);
   const [liveCandle, setLiveCandle] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -236,26 +302,26 @@ function useCandleData(providerId = DEFAULT_PROVIDER_ID, interval = "15") {
     setError(null);
     loadingMoreRef.current = false;
     hasMoreRef.current = true;
-    const cached = getCandlesFromCache(providerId, interval);
+    const cached = getCandlesFromCache(providerId, interval, symbol);
     if (cached.length > 0) setCandles(cached);
     try {
       const { list, hasMore } = await provider.fetchInitial(interval);
       hasMoreRef.current = hasMore;
       setCandles(list);
-      if (list.length > 0) upsertCandlesInCache(providerId, interval, list);
+      if (list.length > 0) upsertCandlesInCache(providerId, interval, symbol, list);
     } catch (err) {
       setError(err.message);
     } finally {
       setLoading(false);
     }
-  }, [providerId, interval]);
+  }, [providerId, interval, symbol]);
 
   const fetchMore = useCallback(async (beforeTimestampMs) => {
     if (loadingMoreRef.current || !hasMoreRef.current) return;
     const beforeSec = Math.floor(beforeTimestampMs / 1000);
     const current = candlesRef.current;
     const oldestInView = current.length > 0 ? current[0].time : Infinity;
-    let fromCache = getCandlesFromCache(providerId, interval).filter(
+    let fromCache = getCandlesFromCache(providerId, interval, symbol).filter(
       (c) => c.time < beforeSec && c.time < oldestInView
     );
     const CACHE_FETCH_MORE_LIMIT = 1000;
@@ -263,7 +329,7 @@ function useCandleData(providerId = DEFAULT_PROVIDER_ID, interval = "15") {
       fromCache = fromCache.slice(-CACHE_FETCH_MORE_LIMIT);
     }
     if (fromCache.length > 0) {
-      const range = getCachedRange(providerId, interval);
+      const range = getCachedRange(providerId, interval, symbol);
       // Cache range only tells what we have locally, not what exists remotely.
       // Do not set hasMore=false here, otherwise we can block the API fetch
       // once we hit the oldest cached candle.
@@ -282,7 +348,7 @@ function useCandleData(providerId = DEFAULT_PROVIDER_ID, interval = "15") {
       const { list, hasMore } = await provider.fetchMore(interval, beforeTimestampMs);
       hasMoreRef.current = hasMore;
       if (list.length > 0) {
-        upsertCandlesInCache(providerId, interval, list);
+        upsertCandlesInCache(providerId, interval, symbol, list);
         setCandles((prev) => {
           const prevOldestTime = prev.length > 0 ? prev[0].time : Infinity;
           const filtered = list.filter((c) => c.time < prevOldestTime);
@@ -294,7 +360,7 @@ function useCandleData(providerId = DEFAULT_PROVIDER_ID, interval = "15") {
     } finally {
       loadingMoreRef.current = false;
     }
-  }, [providerId, interval]);
+  }, [providerId, interval, symbol]);
 
   useEffect(() => { fetchInitial(); }, [fetchInitial]);
 
@@ -394,6 +460,8 @@ function StrategyControls({
   onTrailPctChange,
   minFePct,
   onMinFePctChange,
+  prpEntryPriceMode,
+  onPrpEntryPriceModeChange,
 }) {
   const strategy = STRATEGY_MAP[selectedId];
 
@@ -504,6 +572,22 @@ function StrategyControls({
 
       {/* Divider */}
       <div style={{ width: 1, height: 14, background: THEME.border }} />
+
+      {selectedId === "prp-pivot-psar" && (
+        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: THEME.textSecondary }}>
+          Entry Price Mode
+          <select
+            value={prpEntryPriceMode}
+            onChange={(e) => onPrpEntryPriceModeChange(e.target.value)}
+            style={{ background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 12, cursor: "pointer" }}
+          >
+            <option value="Legacy">Legacy (Old)</option>
+            <option value="Actual">Actual (1m RVOL)</option>
+          </select>
+        </label>
+      )}
+
+      {selectedId === "prp-pivot-psar" && <div style={{ width: 1, height: 14, background: THEME.border }} />}
 
       {/* Auto-generated param inputs */}
       {Object.entries(strategy.paramSchema).map(([key, schema]) => (
@@ -1564,6 +1648,28 @@ function MetricsTab({ trades }) {
   );
 }
 
+function maxConsecutiveStreaks(closedTrades) {
+  let maxWin = 0;
+  let maxLoss = 0;
+  let runWin = 0;
+  let runLoss = 0;
+  for (const t of closedTrades) {
+    if (t.netPnL > 0) {
+      runWin += 1;
+      runLoss = 0;
+      maxWin = Math.max(maxWin, runWin);
+    } else if (t.netPnL < 0) {
+      runLoss += 1;
+      runWin = 0;
+      maxLoss = Math.max(maxLoss, runLoss);
+    } else {
+      runWin = 0;
+      runLoss = 0;
+    }
+  }
+  return { maxWinStreak: maxWin, maxLossStreak: maxLoss };
+}
+
 // ─── Component: StrategyReport ────────────────────────────────────────────────
 function StrategyReport({ trades, strategyName, onTradeSelect, selectedTradeNumber, detailPanel }) {
   const [activeTab, setActiveTab] = useState("trades");
@@ -1573,6 +1679,7 @@ function StrategyReport({ trades, strategyName, onTradeSelect, selectedTradeNumb
   const totalPnL = trades.reduce((sum, t) => (!t.isOpen ? sum + t.netPnL : sum), 0);
 
   const closed = trades.filter((t) => !t.isOpen);
+  const { maxWinStreak, maxLossStreak } = maxConsecutiveStreaks(closed);
   const winners = closed.filter((t) => t.netPnL > 0);
   const losers = closed.filter((t) => t.netPnL < 0);
   const avgWinPct = winners.length > 0 ? winners.reduce((s, t) => s + (t.netPnLPercent ?? 0), 0) / winners.length : null;
@@ -1598,6 +1705,12 @@ function StrategyReport({ trades, strategyName, onTradeSelect, selectedTradeNumb
           <span>Win rate: {closedTrades ? Math.round((winTrades / closedTrades) * 100) : 0}%</span>
           <span style={{ color: totalPnL >= 0 ? THEME.green : THEME.red, fontWeight: 600 }}>
             Total P&L: {totalPnL >= 0 ? "+" : ""}{formatPrice(totalPnL)} USDT
+          </span>
+          <span>
+            Max win streak: {closedTrades ? maxWinStreak : "—"} trades
+          </span>
+          <span>
+            Max loss streak: {closedTrades ? maxLossStreak : "—"} trades
           </span>
           <span>Avg Win: {avgWinPct != null ? `${avgWinPct >= 0 ? "+" : ""}${avgWinPct.toFixed(2)}%` : "—"}</span>
           <span>Avg Loss: {avgLossPct != null ? `${avgLossPct.toFixed(2)}%` : "—"}</span>
@@ -1800,7 +1913,8 @@ export default function App() {
   const [selectedInterval, setSelectedInterval] = useState("30");
   const { candles, liveCandle, loading, error, refetch, fetchMore, hasMoreRef, loadingMoreRef, provider } =
     useCandleData(selectedProviderId, selectedInterval);
-  const symbolLabel = provider?.getSymbol?.() ?? "—";
+  const selectedSymbol = provider?.getSymbol?.() ?? "BTCUSDT";
+  const symbolLabel = selectedSymbol ?? "—";
 
   // Strategy state
   const [selectedStrategyId, setSelectedStrategyId] = useState(STRATEGIES[0].id);
@@ -1812,6 +1926,7 @@ export default function App() {
   const [minFePct, setMinFePct]         = useState(1); // min FE% of position to activate trail
   const [partialThresholdPct, setPartialThresholdPct] = useState(0);
   const [partialCloseRatioPct, setPartialCloseRatioPct] = useState(50);
+  const [prpEntryPriceMode, setPrpEntryPriceMode] = useState("Legacy");
   const [selectedTradeForDetail, setSelectedTradeForDetail] = useState(null);
   const [minuteDetailVisible, setMinuteDetailVisible] = useState(true);
   const [minuteDetailRows, setMinuteDetailRows] = useState([]);
@@ -1820,7 +1935,9 @@ export default function App() {
   const [minuteDetailSource, setMinuteDetailSource] = useState(null);
   const [minuteDetailWindow, setMinuteDetailWindow] = useState({ startMs: null, endMs: null });
   const minuteDetailCacheRef = useRef(new Map());
+  const minuteRangeCacheRef = useRef(new Map());
   const minuteDetailReqRef = useRef(0);
+  const [repricedPrpSignals, setRepricedPrpSignals] = useState(null);
 
   // Cập nhật params khi đổi strategy
   const handleStrategyChange = (id) => {
@@ -1834,15 +1951,105 @@ export default function App() {
 
   // liveCandle throttled 30s — tránh backtest recompute mỗi WS tick
   const liveCandleForBacktest = useThrottle(liveCandle, 30000);
+  const allCandlesForBacktest = useMemo(
+    () => (liveCandleForBacktest ? [...candles, liveCandleForBacktest] : candles),
+    [candles, liveCandleForBacktest]
+  );
+
+  useEffect(() => {
+    const strategy = STRATEGY_MAP[selectedStrategyId];
+    if (!strategy || selectedStrategyId !== "prp-pivot-psar" || !allCandlesForBacktest.length) {
+      setRepricedPrpSignals(null);
+      return;
+    }
+    if (prpEntryPriceMode !== "Actual") {
+      setRepricedPrpSignals(null);
+      return;
+    }
+    if (strategyParams.filterMode !== "RVOL") {
+      setRepricedPrpSignals(null);
+      return;
+    }
+
+    const reqId = Date.now();
+    let cancelled = false;
+    const tfMs = intervalToMinutes(selectedInterval) * 60 * 1000;
+    const lookback = Number(strategyParams.rvolLookback ?? 0);
+    const minRvol = Number(strategyParams.rvolMin ?? 0);
+    const baseSignals = strategy.generateSignals(allCandlesForBacktest, strategyParams);
+
+    (async () => {
+      const nextSignals = [...baseSignals];
+      for (let idx = 0; idx < nextSignals.length; idx++) {
+        const s = nextSignals[idx];
+        const bar = allCandlesForBacktest[s.barIndex];
+        if (!bar) continue;
+        const startMs = bar.timestamp;
+        const endMs = startMs + tfMs;
+        const { candles: minuteCandles } = await loadMinuteRangeCached({
+          providerId: selectedProviderId,
+          symbol: selectedSymbol,
+          startMs,
+          endMs,
+          inMemoryRef: minuteRangeCacheRef,
+        });
+        if (cancelled || reqId == null) return;
+        if (!minuteCandles.length) continue;
+        const tfCandles = allCandlesForBacktest.filter((c) => c.timestamp < startMs).sort((a, b) => a.time - b.time);
+        const rvolArr = calcDynamicRvolForMinuteRows(minuteCandles, tfCandles, startMs, lookback);
+        const tick = Number(strategyParams.minTick ?? 0.1);
+        const triggerLevel = s.type === "long"
+          ? (s.stopLevel ?? 0) + tick
+          : (s.stopLevel ?? 0) - tick;
+        let repriced = null;
+        for (let i = 0; i < minuteCandles.length; i++) {
+          const m = minuteCandles[i];
+          const rvol = rvolArr[i];
+          if (rvol == null || rvol < minRvol) continue;
+          if (s.type === "long") {
+            if (m.close >= triggerLevel) {
+              repriced = m.close;
+              break;
+            }
+          } else if (s.type === "short") {
+            if (m.close <= triggerLevel) {
+              repriced = m.close;
+              break;
+            }
+          }
+        }
+        if (repriced != null && Number.isFinite(repriced)) {
+          nextSignals[idx] = { ...s, entryPrice: repriced };
+        }
+      }
+      if (!cancelled) setRepricedPrpSignals(nextSignals);
+    })().catch(() => {
+      if (!cancelled) setRepricedPrpSignals(null);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    selectedStrategyId,
+    strategyParams,
+    allCandlesForBacktest,
+    selectedInterval,
+    selectedProviderId,
+    selectedSymbol,
+    prpEntryPriceMode,
+  ]);
 
   // Chạy backtest mỗi khi confirmed candles hoặc throttled live candle thay đổi
   const trades = useMemo(() => {
-    const allCandles = liveCandleForBacktest ? [...candles, liveCandleForBacktest] : candles;
+    const allCandles = allCandlesForBacktest;
     if (allCandles.length === 0) return [];
     const strategy = STRATEGY_MAP[selectedStrategyId];
-    const sigs = strategy.generateSignals(allCandles, strategyParams);
+    const sigs = selectedStrategyId === "prp-pivot-psar" && repricedPrpSignals?.length
+      ? repricedPrpSignals
+      : strategy.generateSignals(allCandles, strategyParams);
     return runBacktest(allCandles, sigs, { positionSizeUSDT: positionSize, feePct: feePct / 100 });
-  }, [candles, liveCandleForBacktest, selectedStrategyId, strategyParams, positionSize, feePct]);
+  }, [allCandlesForBacktest, selectedStrategyId, strategyParams, positionSize, feePct, repricedPrpSignals]);
 
   const partialEnabled = partialThresholdPct > 0 && partialCloseRatioPct > 0 && partialCloseRatioPct <= 100;
 
@@ -1950,15 +2157,15 @@ export default function App() {
       const desiredStateStartMs = windowStartMs - bufferTfBars * tfMs;
       const stateStartMs = Math.max(desiredStateStartMs, maxStateStartMs);
 
-      try {
-        minuteCandlesAll = await fetchMinuteRangeByProvider(selectedProviderId, stateStartMs, windowEndMs);
-      } catch {
-        minuteCandlesAll = [];
-      }
-      if (minuteCandlesAll.length === 0) {
-        source = "bybit";
-        minuteCandlesAll = await fetchBybitMinuteRange(stateStartMs, windowEndMs, "BTCUSDT");
-      }
+      const loaded = await loadMinuteRangeCached({
+        providerId: selectedProviderId,
+        symbol: selectedSymbol,
+        startMs: stateStartMs,
+        endMs: windowEndMs,
+        inMemoryRef: minuteRangeCacheRef,
+      });
+      minuteCandlesAll = loaded.candles;
+      source = loaded.source;
 
       const minuteCandles = minuteCandlesAll.filter((c) => c.timestamp >= windowStartMs && c.timestamp < windowEndMs);
       if (minuteCandles.length === 0) {
@@ -2040,7 +2247,7 @@ export default function App() {
       setMinuteDetailSource(null);
       setMinuteDetailLoading(false);
     });
-  }, [selectedTradeForDetail, selectedProviderId, symbolLabel, selectedInterval, selectedStrategyId, strategyParams]);
+  }, [selectedTradeForDetail, selectedProviderId, selectedSymbol, symbolLabel, selectedInterval, selectedStrategyId, strategyParams]);
 
   const pendingLevels = useMemo(() => {
     const s = STRATEGY_MAP[selectedStrategyId];
@@ -2143,6 +2350,8 @@ export default function App() {
         onTrailPctChange={setTrailPct}
         minFePct={minFePct}
         onMinFePctChange={setMinFePct}
+        prpEntryPriceMode={prpEntryPriceMode}
+        onPrpEntryPriceModeChange={setPrpEntryPriceMode}
       />
 
       {/* Chart — 60% height */}

@@ -1,4 +1,4 @@
-// Persistent chart history cache (localStorage), keyed by provider + interval.
+// Persistent chart history cache (localStorage), keyed by provider + symbol + interval.
 // Used to show history immediately on load and to avoid refetch when scrolling back.
 
 const CACHE_KEY = "tvbt_cache_v1";
@@ -13,7 +13,7 @@ function getStorage() {
  * @typedef {{ time: number, timestamp?: number, open: number, high: number, low: number, close: number, volume?: number }} Candle
  * @typedef {{ from: number, to: number }} Range
  * @typedef {{ candles: Candle[], lastUpdated?: number, range?: Range }} SeriesEntry
- * @typedef {Record<string, Record<string, SeriesEntry>>} CacheState
+ * @typedef {Record<string, Record<string, Record<string, SeriesEntry>>>} CacheState
  */
 
 /**
@@ -49,9 +49,19 @@ export function saveCache(state) {
  * @param {string} interval
  * @returns {Candle[]}
  */
-export function getCandlesFromCache(providerId, interval) {
+function resolveEntry(state, providerId, interval, symbol = "BTCUSDT") {
+  const byProvider = state[providerId];
+  if (!byProvider) return null;
+  // New format: provider -> symbol -> interval
+  if (byProvider[symbol]?.[interval]) return byProvider[symbol][interval];
+  // Backward compatibility with old format: provider -> interval
+  if (byProvider[interval]?.candles) return byProvider[interval];
+  return null;
+}
+
+export function getCandlesFromCache(providerId, interval, symbol = "BTCUSDT") {
   const state = loadCache();
-  const entry = state[providerId]?.[interval];
+  const entry = resolveEntry(state, providerId, interval, symbol);
   if (!entry?.candles?.length) return [];
   return [...entry.candles].sort((a, b) => a.time - b.time);
 }
@@ -62,12 +72,13 @@ export function getCandlesFromCache(providerId, interval) {
  * @param {string} interval
  * @param {Candle[]} newCandles
  */
-export function upsertCandlesInCache(providerId, interval, newCandles) {
+export function upsertCandlesInCache(providerId, interval, symbol = "BTCUSDT", newCandles) {
   if (!newCandles?.length) return;
   const state = loadCache();
   if (!state[providerId]) state[providerId] = {};
-  if (!state[providerId][interval]) state[providerId][interval] = { candles: [] };
-  const entry = state[providerId][interval];
+  if (!state[providerId][symbol]) state[providerId][symbol] = {};
+  if (!state[providerId][symbol][interval]) state[providerId][symbol][interval] = { candles: [] };
+  const entry = state[providerId][symbol][interval];
   const byTime = new Map(entry.candles.map((c) => [c.time, c]));
   for (const c of newCandles) {
     if (c != null && typeof c.time === "number") byTime.set(c.time, c);
@@ -90,8 +101,8 @@ export function upsertCandlesInCache(providerId, interval, newCandles) {
  * @param {string} interval
  * @returns {{ from: number, to: number } | null}
  */
-export function getCachedRange(providerId, interval) {
+export function getCachedRange(providerId, interval, symbol = "BTCUSDT") {
   const state = loadCache();
-  const entry = state[providerId]?.[interval];
+  const entry = resolveEntry(state, providerId, interval, symbol);
   return entry?.range ?? null;
 }

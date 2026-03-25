@@ -139,6 +139,7 @@ export function runBacktest(candles, signals, { positionSizeUSDT = 10000, feePct
 
   for (const signal of signals) {
     const bar = candles[signal.barIndex];
+    if (!bar) continue;
 
     // Kiểm tra SL/TP trước khi xử lý signal tiếp theo
     if (position) {
