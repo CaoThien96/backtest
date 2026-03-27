@@ -38,6 +38,46 @@ const THEME = {
   blue: "#2962ff",
 };
 
+const ASSET_OPTIONS = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE"];
+const VISIBLE_PROVIDERS = PROVIDERS.filter((p) => p.id !== "kraken");
+// Provider-specific symbol mapping (used for REST/WS endpoints + cache keys)
+const ASSET_BY_PROVIDER_SYMBOL = {
+  bybit: {
+    BTC: "BTCUSDT",
+    ETH: "ETHUSDT",
+    BNB: "BNBUSDT",
+    SOL: "SOLUSDT",
+    XRP: "XRPUSDT",
+    DOGE: "DOGEUSDT",
+  },
+  coinbase: {
+    BTC: "BTC-USD",
+    ETH: "ETH-USD",
+    BNB: "BNB-USD",
+    SOL: "SOL-USD",
+    XRP: "XRP-USD",
+    DOGE: "DOGE-USD",
+  },
+  bitstamp: {
+    BTC: "btcusd",
+    ETH: "ethusd",
+    BNB: "bnbusd",
+    SOL: "solusd",
+    XRP: "xrpusd",
+    DOGE: "dogeusd",
+  },
+  kraken: {
+    // Kraken OHLC REST expects XBTUSD / XETHZUSD
+    BTC: "XBTUSD",
+    ETH: "XETHZUSD",
+    DOGE: "XDGUSD",
+  },
+};
+
+function getProviderSymbol(providerId, asset) {
+  return ASSET_BY_PROVIDER_SYMBOL?.[providerId]?.[asset] ?? "BTCUSDT";
+}
+
 const PREFETCH_THRESHOLD = 50;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -137,13 +177,14 @@ async function fetchBybitMinuteRange(startMs, endMs, symbol = "BTCUSDT") {
 }
 
 async function fetchMinuteRangeByProvider(providerId, startMs, endMs, symbol = "BTCUSDT") {
+  if (providerId === "kraken") return [];
   if (providerId === "bybit") {
     return fetchBybitMinuteRange(startMs, endMs, symbol);
   }
   if (providerId === "coinbase") {
     const start = new Date(startMs).toISOString();
     const end = new Date(endMs - 1).toISOString();
-    const url = `https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
+    const url = `https://api.exchange.coinbase.com/products/${encodeURIComponent(symbol)}/candles?granularity=60&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
     const res = await window.fetch(url);
     if (!res.ok) throw new Error(`Coinbase API: ${res.status}`);
     const list = await res.json();
@@ -163,7 +204,7 @@ async function fetchMinuteRangeByProvider(providerId, startMs, endMs, symbol = "
   if (providerId === "bitstamp") {
     const startSec = Math.floor(startMs / 1000);
     const endSec = Math.floor((endMs - 1) / 1000);
-    const url = `https://www.bitstamp.net/api/v2/ohlc/btcusd/?step=60&limit=1000&start=${startSec}&end=${endSec}`;
+    const url = `https://www.bitstamp.net/api/v2/ohlc/${encodeURIComponent(symbol)}/?step=60&limit=1000&start=${startSec}&end=${endSec}`;
     const res = await window.fetch(url);
     if (!res.ok) throw new Error(`Bitstamp API: ${res.status}`);
     const data = await res.json();
@@ -184,7 +225,7 @@ async function fetchMinuteRangeByProvider(providerId, startMs, endMs, symbol = "
   }
   if (providerId === "kraken") {
     const sinceSec = Math.floor(startMs / 1000);
-    const url = `https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=1&since=${sinceSec}`;
+    const url = `https://api.kraken.com/0/public/OHLC?pair=${encodeURIComponent(symbol)}&interval=1&since=${sinceSec}`;
     const res = await window.fetch(url);
     const data = await res.json();
     if (data.error && data.error.length) throw new Error(data.error.join(" ") || "Kraken API error");
@@ -276,9 +317,9 @@ function useThrottle(value, delay) {
 }
 
 // ─── Hook: candle data + load more (provider-driven) ──────────────────────────
-function useCandleData(providerId = DEFAULT_PROVIDER_ID, interval = "15") {
+function useCandleData(providerId = DEFAULT_PROVIDER_ID, interval = "15", symbolOverride) {
   const provider = getProvider(providerId);
-  const symbol = provider?.getSymbol?.() ?? "BTCUSDT";
+  const symbol = symbolOverride ?? provider?.getSymbol?.() ?? "BTCUSDT";
   const [candles, setCandles] = useState([]);
   const [liveCandle, setLiveCandle] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -305,7 +346,7 @@ function useCandleData(providerId = DEFAULT_PROVIDER_ID, interval = "15") {
     const cached = getCandlesFromCache(providerId, interval, symbol);
     if (cached.length > 0) setCandles(cached);
     try {
-      const { list, hasMore } = await provider.fetchInitial(interval);
+      const { list, hasMore } = await provider.fetchInitial(interval, symbol);
       hasMoreRef.current = hasMore;
       setCandles(list);
       if (list.length > 0) upsertCandlesInCache(providerId, interval, symbol, list);
@@ -345,7 +386,7 @@ function useCandleData(providerId = DEFAULT_PROVIDER_ID, interval = "15") {
     }
     loadingMoreRef.current = true;
     try {
-      const { list, hasMore } = await provider.fetchMore(interval, beforeTimestampMs);
+      const { list, hasMore } = await provider.fetchMore(interval, beforeTimestampMs, symbol);
       hasMoreRef.current = hasMore;
       if (list.length > 0) {
         upsertCandlesInCache(providerId, interval, symbol, list);
@@ -374,7 +415,7 @@ function useCandleData(providerId = DEFAULT_PROVIDER_ID, interval = "15") {
     wsRef.current = ws;
 
     ws.onopen = () => {
-      const payloads = provider.getWsSubscribePayload(interval);
+      const payloads = provider.getWsSubscribePayload(interval, symbol);
       if (Array.isArray(payloads)) {
         payloads.forEach((p) => ws.send(JSON.stringify(p)));
       } else if (payloads) {
@@ -423,7 +464,7 @@ function useCandleData(providerId = DEFAULT_PROVIDER_ID, interval = "15") {
     };
 
     ws.onerror = () => ws.close();
-  }, [providerId, interval]);
+  }, [providerId, interval, symbol]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -631,6 +672,8 @@ function CandlestickChart({
   onIntervalChange,
   selectedProviderId,
   onProviderChange,
+  selectedAsset,
+  onAssetChange,
   symbolLabel,
   pendingBuy,
   pendingSell,
@@ -642,6 +685,14 @@ function CandlestickChart({
   pivotLowTime,
   currentRvol,
 }) {
+  // Safety: ensure we never keep an invalid provider id when Kraken is hidden.
+  useEffect(() => {
+    const visibleIds = new Set(VISIBLE_PROVIDERS.map((p) => p.id));
+    if (visibleIds.has(selectedProviderId)) return;
+    const fallbackId = VISIBLE_PROVIDERS[0]?.id ?? DEFAULT_PROVIDER_ID;
+    if (fallbackId !== selectedProviderId) onProviderChange?.(fallbackId);
+  }, [selectedProviderId, onProviderChange]);
+
   const containerRef = useRef(null);
   const chartRef = useRef(null);
   const candleSeriesRef = useRef(null);
@@ -1072,8 +1123,17 @@ function CandlestickChart({
           onChange={(e) => onProviderChange(e.target.value)}
           style={{ background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "3px 8px", fontSize: 12, cursor: "pointer" }}
         >
-          {PROVIDERS.map((p) => (
+          {VISIBLE_PROVIDERS.map((p) => (
             <option key={p.id} value={p.id}>{p.name}</option>
+          ))}
+        </select>
+        <select
+          value={selectedAsset}
+          onChange={(e) => onAssetChange?.(e.target.value)}
+          style={{ background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "3px 8px", fontSize: 12, cursor: "pointer" }}
+        >
+          {ASSET_OPTIONS.map((asset) => (
+            <option key={asset} value={asset}>{asset}</option>
           ))}
         </select>
         <span style={{ color: THEME.textPrimary, fontWeight: 700, fontSize: 13 }}>{symbolLabel} · {INTERVALS.find((i) => i.value === selectedInterval)?.label ?? selectedInterval}{rvolText}</span>
@@ -1911,14 +1971,70 @@ function simulatePartialTakeProfit(trade, allCandles, thresholdPct, closeRatioPc
 export default function App() {
   const [selectedProviderId, setSelectedProviderId] = useState(DEFAULT_PROVIDER_ID);
   const [selectedInterval, setSelectedInterval] = useState("30");
-  const { candles, liveCandle, loading, error, refetch, fetchMore, hasMoreRef, loadingMoreRef, provider } =
-    useCandleData(selectedProviderId, selectedInterval);
-  const selectedSymbol = provider?.getSymbol?.() ?? "BTCUSDT";
+  const SYMBOL_STORAGE_KEY = "tvbt_symbol_v1";
+  const [selectedAsset, setSelectedAsset] = useState(() => {
+    try {
+      const v = window?.localStorage?.getItem(SYMBOL_STORAGE_KEY);
+      return ASSET_OPTIONS.includes(v) ? v : "BTC";
+    } catch {
+      return "BTC";
+    }
+  });
+  const selectedSymbol = getProviderSymbol(selectedProviderId, selectedAsset);
   const symbolLabel = selectedSymbol ?? "—";
 
+  const { candles, liveCandle, loading, error, refetch, fetchMore, hasMoreRef, loadingMoreRef } =
+    useCandleData(selectedProviderId, selectedInterval, selectedSymbol);
+
+  // ─── Persist strategy params per symbol ──────────────────────────────────
+  const STRATEGY_PARAMS_STORAGE_KEY_PREFIX = "tvbt_strategy_params_v1";
+
+  function makeStrategyParamsKey(providerId, asset, strategyId) {
+    return `${STRATEGY_PARAMS_STORAGE_KEY_PREFIX}|${providerId}|${asset}|${strategyId}`;
+  }
+
+  function loadStrategyParams(providerId, asset, strategyId) {
+    try {
+      const raw = window?.localStorage?.getItem(makeStrategyParamsKey(providerId, asset, strategyId));
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function saveStrategyParams(providerId, asset, strategyId, params) {
+    try {
+      window?.localStorage?.setItem(
+        makeStrategyParamsKey(providerId, asset, strategyId),
+        JSON.stringify(params ?? {})
+      );
+    } catch {
+      // ignore
+    }
+  }
+
+  const handleAssetChange = (asset) => {
+    const next = ASSET_OPTIONS.includes(asset) ? asset : "BTC";
+    if (next === selectedAsset) return;
+    setSelectedAsset(next);
+    try {
+      window?.localStorage?.setItem(SYMBOL_STORAGE_KEY, next);
+    } catch {
+      // ignore
+    }
+    // Force refresh to avoid any stale WS/minute-detail state from previous symbol.
+    window.location.reload();
+  };
+
   // Strategy state
-  const [selectedStrategyId, setSelectedStrategyId] = useState(STRATEGIES[0].id);
-  const [strategyParams, setStrategyParams] = useState(getDefaultParams(STRATEGIES[0]));
+  const initialStrategyId = STRATEGIES[0].id;
+  const [selectedStrategyId, setSelectedStrategyId] = useState(initialStrategyId);
+  const [strategyParams, setStrategyParams] = useState(() => {
+    const stored = loadStrategyParams(selectedProviderId, selectedAsset, initialStrategyId);
+    return stored ?? getDefaultParams(STRATEGIES[0]);
+  });
   const [positionSize, setPositionSize] = useState(5000);
   const [feePct, setFeePct]             = useState(0.05); // % per side (open and close)
   const [trailEnabled, setTrailEnabled] = useState(false);
@@ -1938,16 +2054,39 @@ export default function App() {
   const minuteRangeCacheRef = useRef(new Map());
   const minuteDetailReqRef = useRef(0);
   const [repricedPrpSignals, setRepricedPrpSignals] = useState(null);
+  const skipPersistRef = useRef(false);
 
   // Cập nhật params khi đổi strategy
   const handleStrategyChange = (id) => {
+    // Avoid persisting the previous symbol's params during the first render after restore.
+    skipPersistRef.current = true;
     setSelectedStrategyId(id);
-    setStrategyParams(getDefaultParams(STRATEGY_MAP[id]));
+    const stored = loadStrategyParams(selectedProviderId, selectedAsset, id);
+    setStrategyParams(stored ?? getDefaultParams(STRATEGY_MAP[id]));
   };
 
   const handleParamChange = (key, val) => {
     setStrategyParams((prev) => ({ ...prev, [key]: val }));
   };
+
+  // Restore params when switching provider/symbol; keep the currently selected strategy id.
+  useEffect(() => {
+    const strategy = STRATEGY_MAP[selectedStrategyId];
+    if (!strategy) return;
+    // Avoid persisting the previous symbol's params during the first render after restore.
+    skipPersistRef.current = true;
+    const stored = loadStrategyParams(selectedProviderId, selectedAsset, selectedStrategyId);
+    setStrategyParams(stored ?? getDefaultParams(strategy));
+  }, [selectedProviderId, selectedAsset]);
+
+  // Persist params on every edit for this provider+symbol+strategy.
+  useEffect(() => {
+    if (skipPersistRef.current) {
+      skipPersistRef.current = false;
+      return;
+    }
+    saveStrategyParams(selectedProviderId, selectedAsset, selectedStrategyId, strategyParams);
+  }, [selectedProviderId, selectedAsset, selectedStrategyId, strategyParams]);
 
   // liveCandle throttled 30s — tránh backtest recompute mỗi WS tick
   const liveCandleForBacktest = useThrottle(liveCandle, 30000);
@@ -2367,6 +2506,8 @@ export default function App() {
           onIntervalChange={setSelectedInterval}
           selectedProviderId={selectedProviderId}
           onProviderChange={setSelectedProviderId}
+          selectedAsset={selectedAsset}
+          onAssetChange={handleAssetChange}
           symbolLabel={symbolLabel}
           pendingBuy={trades.length > 0 && trades[trades.length - 1].isOpen && trades[trades.length - 1].type === "Long" ? null : pendingLevels.buy}
           pendingSell={trades.length > 0 && trades[trades.length - 1].isOpen && trades[trades.length - 1].type === "Short" ? null : pendingLevels.sell}

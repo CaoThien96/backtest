@@ -44,8 +44,8 @@ export const CoinbaseProvider = {
     return INTERVAL_TO_GRANULARITY[interval] ?? 900;
   },
 
-  async fetchInitial(interval) {
-    const productId = this.getSymbol();
+  async fetchInitial(interval, productIdOverride) {
+    const productId = productIdOverride ?? this.getSymbol();
     const granularity = this.mapInterval(interval);
     // Coinbase ignores range unless both start and end are set; request last PAGE_SIZE candles.
     const endMs = Date.now();
@@ -61,8 +61,8 @@ export const CoinbaseProvider = {
     return { list: normalized, hasMore: list.length >= PAGE_SIZE };
   },
 
-  async fetchMore(interval, beforeTimestampMs) {
-    const productId = this.getSymbol();
+  async fetchMore(interval, beforeTimestampMs, productIdOverride) {
+    const productId = productIdOverride ?? this.getSymbol();
     const granularity = this.mapInterval(interval);
     // Coinbase ignores the range if either start or end is missing — must send both (ISO 8601).
     const endMs = beforeTimestampMs - 1;
@@ -84,9 +84,9 @@ export const CoinbaseProvider = {
     return interval === "5"; // Coinbase WS only has 5-minute buckets
   },
 
-  getWsSubscribePayload(interval) {
+  getWsSubscribePayload(interval, productIdOverride) {
     if (!this.wsSupportsInterval(interval)) return [];
-    const productId = this.getSymbol();
+    const productId = productIdOverride ?? this.getSymbol();
     return [
       { type: "subscribe", product_ids: [productId], channel: "candles" },
       { type: "subscribe", channel: "heartbeats" },

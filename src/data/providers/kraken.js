@@ -47,9 +47,10 @@ export const KrakenProvider = {
     return INTERVAL_TO_MINUTES[interval] ?? 15;
   },
 
-  async fetchInitial(interval) {
+  async fetchInitial(interval, pairOverride) {
     const minutes = this.mapInterval(interval);
-    const url = `${KRAKEN_REST}?pair=XBTUSD&interval=${minutes}`;
+    const pair = pairOverride ?? "XBTUSD";
+    const url = `${KRAKEN_REST}?pair=${pair}&interval=${minutes}`;
     const res = await window.fetch(url);
     const data = await res.json();
     if (data.error && data.error.length) throw new Error(data.error.join(" ") || "Kraken API error");
@@ -72,13 +73,20 @@ export const KrakenProvider = {
     return Object.hasOwn(INTERVAL_TO_MINUTES, interval);
   },
 
-  getWsSubscribePayload(interval) {
+  getWsSubscribePayload(interval, pairOverride) {
     if (!this.wsSupportsInterval(interval)) return [];
     const minutes = this.mapInterval(interval);
+    // WS expects "BTC/USD" / "ETH/USD", while REST expects "XBTUSD" / "XETHZUSD".
+    const restPair = pairOverride ?? "XBTUSD";
+    const wsSymbol = restPair.includes("/")
+      ? restPair
+      : restPair === "XETHZUSD"
+        ? "ETH/USD"
+        : "BTC/USD";
     return [
       {
         method: "subscribe",
-        params: { channel: "ohlc", symbol: ["BTC/USD"], interval: minutes },
+        params: { channel: "ohlc", symbol: [wsSymbol], interval: minutes },
       },
     ];
   },

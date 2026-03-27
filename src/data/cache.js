@@ -55,7 +55,11 @@ function resolveEntry(state, providerId, interval, symbol = "BTCUSDT") {
   // New format: provider -> symbol -> interval
   if (byProvider[symbol]?.[interval]) return byProvider[symbol][interval];
   // Backward compatibility with old format: provider -> interval
-  if (byProvider[interval]?.candles) return byProvider[interval];
+  // Only apply legacy fallback for BTC-like symbols.
+  // Otherwise, non-BTC symbols (e.g. SOL/BNB/XRP) can accidentally read old BTC cached candles.
+  const upper = String(symbol).toUpperCase();
+  const btcLike = upper.includes("BTC") || upper.includes("XBT");
+  if (btcLike && byProvider[interval]?.candles) return byProvider[interval];
   return null;
 }
 

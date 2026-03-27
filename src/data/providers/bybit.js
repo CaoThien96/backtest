@@ -30,8 +30,8 @@ export const BybitProvider = {
     return interval; // "5" | "15" | "30" | "60" | "D"
   },
 
-  async fetchInitial(interval) {
-    const symbol = this.getSymbol();
+  async fetchInitial(interval, symbolOverride) {
+    const symbol = symbolOverride ?? this.getSymbol();
     const url = `${BYBIT_REST}?symbol=${symbol}&category=linear&interval=${interval}&limit=${PAGE_SIZE}`;
     const res = await window.fetch(url);
     const data = await res.json();
@@ -40,8 +40,8 @@ export const BybitProvider = {
     return { list: normalizeBybitList(list), hasMore: list.length >= PAGE_SIZE };
   },
 
-  async fetchMore(interval, beforeTimestampMs) {
-    const symbol = this.getSymbol();
+  async fetchMore(interval, beforeTimestampMs, symbolOverride) {
+    const symbol = symbolOverride ?? this.getSymbol();
     const url = `${BYBIT_REST}?symbol=${symbol}&category=linear&interval=${interval}&limit=${PAGE_SIZE}&end=${beforeTimestampMs - 1}`;
     const res = await window.fetch(url);
     const data = await res.json();
@@ -57,8 +57,8 @@ export const BybitProvider = {
     return true;
   },
 
-  getWsSubscribePayload(interval) {
-    const symbol = this.getSymbol();
+  getWsSubscribePayload(interval, symbolOverride) {
+    const symbol = symbolOverride ?? this.getSymbol();
     return [{ op: "subscribe", args: [`kline.${interval}.${symbol}`] }];
   },
 

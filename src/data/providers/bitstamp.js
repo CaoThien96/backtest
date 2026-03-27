@@ -56,11 +56,12 @@ export const BitstampProvider = {
     return INTERVAL_TO_STEP[interval] ?? 900;
   },
 
-  async fetchInitial(interval) {
+  async fetchInitial(interval, currencyPairOverride) {
     const step = this.mapInterval(interval);
+    const currencyPair = currencyPairOverride ?? CURRENCY_PAIR;
     const endSec = Math.floor(Date.now() / 1000);
     const startSec = endSec - PAGE_SIZE * step;
-    const url = `${BITSTAMP_REST}/${CURRENCY_PAIR}/?step=${step}&limit=${PAGE_SIZE}&start=${startSec}&end=${endSec}`;
+    const url = `${BITSTAMP_REST}/${currencyPair}/?step=${step}&limit=${PAGE_SIZE}&start=${startSec}&end=${endSec}`;
     const res = await window.fetch(url);
     if (!res.ok) throw new Error(`Bitstamp API: ${res.status} ${res.statusText}`);
     const data = await res.json();
@@ -69,11 +70,12 @@ export const BitstampProvider = {
     return { list, hasMore: ohlc.length >= PAGE_SIZE };
   },
 
-  async fetchMore(interval, beforeTimestampMs) {
+  async fetchMore(interval, beforeTimestampMs, currencyPairOverride) {
     const step = this.mapInterval(interval);
+    const currencyPair = currencyPairOverride ?? CURRENCY_PAIR;
     const endSec = Math.floor((beforeTimestampMs - 1) / 1000);
     const startSec = endSec - PAGE_SIZE * step;
-    const url = `${BITSTAMP_REST}/${CURRENCY_PAIR}/?step=${step}&limit=${PAGE_SIZE}&start=${startSec}&end=${endSec}`;
+    const url = `${BITSTAMP_REST}/${currencyPair}/?step=${step}&limit=${PAGE_SIZE}&start=${startSec}&end=${endSec}`;
     const res = await window.fetch(url);
     if (!res.ok) return { list: [], hasMore: false };
     const data = await res.json();
@@ -89,10 +91,11 @@ export const BitstampProvider = {
     return Object.hasOwn(INTERVAL_TO_WS_TIMEFRAME, interval);
   },
 
-  getWsSubscribePayload(interval) {
+  getWsSubscribePayload(interval, currencyPairOverride) {
     if (!this.wsSupportsInterval(interval)) return [];
+    const currencyPair = currencyPairOverride ?? CURRENCY_PAIR;
     const timeframe = INTERVAL_TO_WS_TIMEFRAME[interval] ?? "15m";
-    const channel = `ohlc_${timeframe}_${CURRENCY_PAIR}`;
+    const channel = `ohlc_${timeframe}_${currencyPair}`;
     return [{ event: "bts:subscribe", data: { channel } }];
   },
 
