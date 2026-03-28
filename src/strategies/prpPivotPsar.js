@@ -8,6 +8,7 @@
 //   - Exit: ATR-based SL/TP (per-bar dynamic, via exitFn)
 
 const BTCUSDT_MINTICK = 0.1;
+const PRICE_EPS = 1e-9;
 
 // ── ATR Helper (Wilder's RMA) ─────────────────────────────────────────────────
 function calcATR(candles, length) {
@@ -147,6 +148,7 @@ function computeRvol(candles, lookback) {
   if (!lookback || lookback <= 0) return out;
   let sum = 0;
   for (let i = 0; i < n; i++) {
+
     const v = candles[i].volume ?? 0;
     if (i < lookback) {
       sum += v;
@@ -225,6 +227,23 @@ function computeExitLevels(type, entryPrice, atr, slMultiplier, tpMultiplier, us
   };
 }
 
+function passesDirectionConfirm(type, bar, mode, minBodyBias) {
+  if (!bar || mode === "None") return true;
+  if (mode === "Candle Color") {
+    return type === "long" ? bar.close >= bar.open : bar.close <= bar.open;
+  }
+  if (mode === "Body Bias") {
+    const range = Math.max(bar.high - bar.low, PRICE_EPS);
+    if (type === "long") {
+      const bullishBody = Math.max(bar.close - bar.open, 0);
+      return bullishBody / range >= minBodyBias;
+    }
+    const bearishBody = Math.max(bar.open - bar.close, 0);
+    return bearishBody / range >= minBodyBias;
+  }
+  return true;
+}
+
 // ── Strategy Object ───────────────────────────────────────────────────────────
 export const PrpPivotPsarStrategy = {
   id: "prp-pivot-psar",
@@ -245,6 +264,8 @@ export const PrpPivotPsarStrategy = {
     rvolMin: { type: "number", label: "Min RVOL", default: 1.7, min: 1, max: 5, step: 0.1 },
     mfiLength: { type: "number", label: "MFI Length", default: 14, min: 2, max: 100 },
     mfiMin: { type: "number", label: "MFI Min", default: 50, min: 0, max: 100 },
+    directionConfirmMode: { type: "select", label: "Direction Confirm", default: "None", options: ["None", "Candle Color", "Body Bias"] },
+    minBodyBias: { type: "number", label: "Min Body Bias", default: 0.2, min: 0, max: 1, step: 0.05 },
     useZoneFilter: { type: "select", label: "Zone Filter", default: "Yes", options: ["Yes", "No"] },
     zonePct: { type: "number", label: "Zone Width %", default: 2.6, min: 0.1, max: 5, step: 0.1 },
     tradeDir: { type: "select", label: "Direction", default: "Both", options: ["Long", "Short", "Both"] },
@@ -257,6 +278,7 @@ export const PrpPivotPsarStrategy = {
     atrPeriod, slMultiplier, tpMultiplier,
     useSL, useTP,
     filterMode, rvolLookback, rvolMin, mfiLength, mfiMin,
+    directionConfirmMode, minBodyBias,
     useZoneFilter, zonePct,
     tradeDir,
     minTick,
@@ -277,8 +299,9 @@ export const PrpPivotPsarStrategy = {
     const useSLFlag = useSL === "Yes";
     const useTPFlag = useTP === "Yes";
 
+    const bodyBiasThreshold = Math.max(0, Math.min(1, Number(minBodyBias ?? 0)));
     const passesFilter = (type, i) => {
-      if (!useRvol && !useMfi) return true;
+      const bar = candles[i];
       const rvol = rvolArr ? rvolArr[i] : null;
       const mfi = mfiArr ? mfiArr[i] : null;
       const prevMfi = i > 0 && mfiArr ? mfiArr[i - 1] : null;
@@ -296,6 +319,10 @@ export const PrpPivotPsarStrategy = {
           if (mfi == null || mfi > shortThresh) return false;
           if (prevMfi != null && mfi >= prevMfi) return false;
         }
+      }
+
+      if (!passesDirectionConfirm(type, bar, directionConfirmMode, bodyBiasThreshold)) {
+        return false;
       }
 
       return true;
@@ -450,34 +477,6 @@ export const PrpPivotPsarStrategy = {
     const zoneFilterEnabled = useZoneFilter === "Yes";
     const canLong = tradeDir === "Both" || tradeDir === "Long";
     const canShort = tradeDir === "Both" || tradeDir === "Short";
-
-    const useRvol = filterMode === "RVOL";
-    const useMfi = filterMode === "MFI";
-    const rvolArr = useRvol ? computeRvol(candles, rvolLookback) : null;
-    const mfiArr = useMfi ? computeMfi(candles, mfiLength) : null;
-
-    const passesFilter = (type, i) => {
-      if (!useRvol && !useMfi) return true;
-      const rvol = rvolArr ? rvolArr[i] : null;
-      const mfi = mfiArr ? mfiArr[i] : null;
-      const prevMfi = i > 0 && mfiArr ? mfiArr[i - 1] : null;
-
-      if (useRvol) {
-        if (rvol == null || rvol < rvolMin) return false;
-      }
-
-      if (useMfi) {
-        if (type === "long") {
-          if (mfi == null || mfi < mfiMin) return false;
-          if (prevMfi != null && mfi <= prevMfi) return false;
-        } else {
-          const shortThresh = 100 - mfiMin;
-          if (mfi == null || mfi > shortThresh) return false;
-          if (prevMfi != null && mfi >= prevMfi) return false;
-        }
-      }
-      return true;
-    };
 
     let hprice = 0, lprice = 0, longArmed = false, shortArmed = false;
 

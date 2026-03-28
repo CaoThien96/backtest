@@ -684,6 +684,7 @@ function CandlestickChart({
   pivotHighTime,
   pivotLowTime,
   currentRvol,
+  onCandleClick,
 }) {
   // Safety: ensure we never keep an invalid provider id when Kraken is hidden.
   useEffect(() => {
@@ -713,9 +714,11 @@ function CandlestickChart({
   const lastChartTimeRef = useRef(null); // last time in chart (set when we setData); update() only allowed if live >= this
   const fetchMoreRef = useRef(fetchMore);
   const liveCandleRef = useRef(liveCandle);
+  const onCandleClickRef = useRef(onCandleClick);
   useEffect(() => { candlesRef.current = candles; }, [candles]);
   useEffect(() => { fetchMoreRef.current = fetchMore; }, [fetchMore]);
   useEffect(() => { liveCandleRef.current = liveCandle; }, [liveCandle]);
+  useEffect(() => { onCandleClickRef.current = onCandleClick; }, [onCandleClick]);
 
   const [hoveredTime, setHoveredTime] = useState(null);
   const [activeTimeframe, setActiveTimeframe] = useState("5D");
@@ -761,6 +764,21 @@ function CandlestickChart({
       } else {
         setHoveredTime(null);
       }
+    });
+
+    chart.subscribeClick((param) => {
+      const t = typeof param?.time === "number" ? param.time : null;
+      if (t == null) return;
+      const clicked = candlesRef.current.find((c) => c.time === t);
+      if (!clicked) return;
+      onCandleClickRef.current?.({
+        timestamp: clicked.timestamp,
+        time: clicked.time,
+        open: clicked.open,
+        high: clicked.high,
+        low: clicked.low,
+        close: clicked.close,
+      });
     });
 
     chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
@@ -1315,7 +1333,7 @@ function TradeTable({ trades, onTradeSelect, selectedTradeNumber }) {
   );
 }
 
-function MinuteSimulationTable({ selectedTrade, rows, loading, error, sourceLabel, windowStartMs, windowEndMs, onClose }) {
+function MinuteSimulationTable({ replayTarget, rows, loading, error, sourceLabel, windowStartMs, windowEndMs, onClose }) {
   const panelStyle = {
     borderTop: `1px solid ${THEME.border}`,
     background: THEME.bgSecondary,
@@ -1324,8 +1342,8 @@ function MinuteSimulationTable({ selectedTrade, rows, loading, error, sourceLabe
     overflow: "auto",
   };
 
-  if (!selectedTrade) {
-    return <div style={{ ...panelStyle, color: THEME.textSecondary, fontSize: 12 }}>Click a trade to view minute-level open simulation.</div>;
+  if (!replayTarget) {
+    return <div style={{ ...panelStyle, color: THEME.textSecondary, fontSize: 12 }}>Click a trade row or a chart candle to view minute replay.</div>;
   }
   if (loading) {
     return <div style={{ ...panelStyle, color: THEME.textSecondary, fontSize: 12 }}>Loading minute simulation...</div>;
@@ -1338,7 +1356,9 @@ function MinuteSimulationTable({ selectedTrade, rows, loading, error, sourceLabe
     <div style={panelStyle}>
       <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 8, fontSize: 11 }}>
         <span style={{ color: THEME.textPrimary, fontWeight: 600 }}>
-          Trade #{selectedTrade.tradeNumber} ({selectedTrade.type}) minute replay
+          {replayTarget.type === "trade"
+            ? `Trade #${replayTarget.trade?.tradeNumber} (${replayTarget.trade?.type}) minute replay`
+            : `Candle ${formatDateTime(replayTarget.timestamp)} minute replay`}
         </span>
         <span style={{ color: THEME.textSecondary, display: "flex", alignItems: "center", gap: 10 }}>
           <span>
@@ -1733,6 +1753,7 @@ function maxConsecutiveStreaks(closedTrades) {
 // ─── Component: StrategyReport ────────────────────────────────────────────────
 function StrategyReport({ trades, strategyName, onTradeSelect, selectedTradeNumber, detailPanel }) {
   const [activeTab, setActiveTab] = useState("trades");
+  const [maeThresholdPct, setMaeThresholdPct] = useState(0.1);
 
   const winTrades = trades.filter((t) => !t.isOpen && t.netPnL > 0).length;
   const closedTrades = trades.filter((t) => !t.isOpen).length;
@@ -1746,6 +1767,9 @@ function StrategyReport({ trades, strategyName, onTradeSelect, selectedTradeNumb
   const avgLossPct = losers.length > 0 ? losers.reduce((s, t) => s + (t.netPnLPercent ?? 0), 0) / losers.length : null;
   const maxWinPct = winners.length > 0 ? Math.max(...winners.map((t) => t.netPnLPercent ?? 0)) : null;
   const maxLossPct = losers.length > 0 ? Math.min(...losers.map((t) => t.netPnLPercent ?? 0)) : null;
+  const safeMaeThresholdPct = Math.max(0, Number(maeThresholdPct) || 0);
+  const maeHits = closed.filter((t) => Math.abs(t.adverseExcursionPercent ?? 0) > safeMaeThresholdPct).length;
+  const maeHitRate = closed.length ? (maeHits / closed.length) * 100 : 0;
 
   const firstTs = trades.length > 0 ? trades[0].entryTimestamp : null;
   const startDateStr = firstTs
@@ -1776,6 +1800,18 @@ function StrategyReport({ trades, strategyName, onTradeSelect, selectedTradeNumb
           <span>Avg Loss: {avgLossPct != null ? `${avgLossPct.toFixed(2)}%` : "—"}</span>
           <span>Max Win: {maxWinPct != null ? `+${maxWinPct.toFixed(2)}%` : "—"}</span>
           <span>Max Loss: {maxLossPct != null ? `${maxLossPct.toFixed(2)}%` : "—"}</span>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            MAE &gt;
+            <input
+              type="number"
+              min={0}
+              step={0.1}
+              value={safeMaeThresholdPct}
+              onChange={(e) => setMaeThresholdPct(Math.max(0, Number(e.target.value) || 0))}
+              style={{ width: 54, background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "1px 5px", fontSize: 11, textAlign: "right" }}
+            />
+            %: {maeHits} trades ({maeHitRate.toFixed(1)}%)
+          </span>
         </div>
       </div>
 
@@ -2044,6 +2080,7 @@ export default function App() {
   const [partialCloseRatioPct, setPartialCloseRatioPct] = useState(50);
   const [prpEntryPriceMode, setPrpEntryPriceMode] = useState("Legacy");
   const [selectedTradeForDetail, setSelectedTradeForDetail] = useState(null);
+  const [selectedReplayCandle, setSelectedReplayCandle] = useState(null);
   const [minuteDetailVisible, setMinuteDetailVisible] = useState(true);
   const [minuteDetailRows, setMinuteDetailRows] = useState([]);
   const [minuteDetailLoading, setMinuteDetailLoading] = useState(false);
@@ -2055,6 +2092,26 @@ export default function App() {
   const minuteDetailReqRef = useRef(0);
   const [repricedPrpSignals, setRepricedPrpSignals] = useState(null);
   const skipPersistRef = useRef(false);
+
+  const minuteReplayTarget = useMemo(() => {
+    if (selectedTradeForDetail) {
+      return {
+        type: "trade",
+        key: `trade:${selectedTradeForDetail.tradeNumber}:${selectedTradeForDetail.entryTimestamp}`,
+        timestamp: selectedTradeForDetail.entryTimestamp,
+        trade: selectedTradeForDetail,
+      };
+    }
+    if (selectedReplayCandle) {
+      return {
+        type: "candle",
+        key: `candle:${selectedReplayCandle.timestamp}`,
+        timestamp: selectedReplayCandle.timestamp,
+        candle: selectedReplayCandle,
+      };
+    }
+    return null;
+  }, [selectedTradeForDetail, selectedReplayCandle]);
 
   // Cập nhật params khi đổi strategy
   const handleStrategyChange = (id) => {
@@ -2233,7 +2290,7 @@ export default function App() {
   }, [trades, partialEnabled, partialThresholdPct, partialCloseRatioPct, trailEnabled, trailPct, minFePct, candles, liveCandleForBacktest]);
 
   useEffect(() => {
-    if (!selectedTradeForDetail) {
+    if (!minuteReplayTarget) {
       setMinuteDetailRows([]);
       setMinuteDetailError(null);
       setMinuteDetailLoading(false);
@@ -2244,18 +2301,17 @@ export default function App() {
 
     const strategy = STRATEGY_MAP[selectedStrategyId];
     const timeframeMin = intervalToMinutes(selectedInterval);
-    const windowStartMs = selectedTradeForDetail.entryTimestamp;
+    const windowStartMs = minuteReplayTarget.timestamp;
     const windowEndMs = windowStartMs + timeframeMin * 60 * 1000;
     const tfMs = timeframeMin * 60 * 1000;
     setMinuteDetailWindow({ startMs: windowStartMs, endMs: windowEndMs });
 
     const cacheKey = [
+      minuteReplayTarget.key,
       selectedProviderId,
       symbolLabel,
       selectedInterval,
       selectedStrategyId,
-      selectedTradeForDetail.tradeNumber,
-      selectedTradeForDetail.entryTimestamp,
       JSON.stringify(strategyParams),
     ].join("|");
 
@@ -2276,30 +2332,10 @@ export default function App() {
       let minuteCandlesAll = [];
       let source = selectedProviderId;
 
-      const leftBars = Number(strategyParams.leftBars ?? 0);
-      const rightBars = Number(strategyParams.rightBars ?? 0);
-      const filterMode = strategyParams.filterMode ?? null;
-      const useRvolFilter = filterMode === "RVOL";
-      const useMfiFilter = filterMode === "MFI";
-      const rvolLookback = Number(strategyParams.rvolLookback ?? 0);
-      const mfiLength = Number(strategyParams.mfiLength ?? 0);
-
-      const bufferTfBars = Math.max(
-        leftBars + rightBars + 5,
-        useRvolFilter ? rvolLookback + 5 : 0,
-        useMfiFilter ? mfiLength + 5 : 0
-      );
-
-      // Keep total fetch <= 1000 minutes because current REST helpers don't paginate.
-      const maxFetchMinutes = 1000;
-      const maxStateStartMs = windowEndMs - maxFetchMinutes * 60 * 1000;
-      const desiredStateStartMs = windowStartMs - bufferTfBars * tfMs;
-      const stateStartMs = Math.max(desiredStateStartMs, maxStateStartMs);
-
       const loaded = await loadMinuteRangeCached({
         providerId: selectedProviderId,
         symbol: selectedSymbol,
-        startMs: stateStartMs,
+        startMs: windowStartMs,
         endMs: windowEndMs,
         inMemoryRef: minuteRangeCacheRef,
       });
@@ -2316,34 +2352,6 @@ export default function App() {
         return;
       }
 
-      const stateOffset = minuteCandlesAll.findIndex((c) => c.timestamp >= windowStartMs);
-      const offset = stateOffset >= 0 ? stateOffset : 0;
-
-      const aggregateMinutesToTimeframeCandles = (minutes) => {
-        const map = new Map(); // bucketStartMs -> candle
-        for (const m of minutes) {
-          const bucketStart = Math.floor(m.timestamp / tfMs) * tfMs;
-          if (!map.has(bucketStart)) {
-            map.set(bucketStart, {
-              timestamp: bucketStart,
-              time: Math.floor(bucketStart / 1000),
-              open: m.open,
-              high: m.high,
-              low: m.low,
-              close: m.close,
-              volume: m.volume ?? 0,
-            });
-          } else {
-            const cur = map.get(bucketStart);
-            cur.high = Math.max(cur.high, m.high);
-            cur.low = Math.min(cur.low, m.low);
-            cur.close = m.close;
-            cur.volume += m.volume ?? 0;
-          }
-        }
-        return [...map.values()].sort((a, b) => a.time - b.time);
-      };
-
       const useRvol = Object.prototype.hasOwnProperty.call(strategyParams, "rvolLookback");
       const lookback = Number(strategyParams.rvolLookback ?? 0);
       const timeframeCandles = [...candles].sort((a, b) => a.time - b.time);
@@ -2352,15 +2360,10 @@ export default function App() {
         : new Array(minuteCandles.length).fill(null);
 
       const rows = minuteCandles.map((c, i) => {
-        const absIdx = offset + i;
-        // Pending levels / pivots should be based on fully closed timeframe candles.
-        // For a minute inside bucket [bucketStart, bucketStart+tfMs), the "current" candle
-        // is still forming, so we exclude it by only using minutes < bucketStart.
+        // Stateful strategies must be computed from the same timeframe history shown on chart.
+        // For a minute inside bucket [bucketStart, bucketStart+tfMs), exclude that forming bucket.
         const bucketStartMs = Math.floor(c.timestamp / tfMs) * tfMs;
-        const minutePrefixClosed = minuteCandlesAll
-          .slice(0, absIdx + 1)
-          .filter((m) => m.timestamp < bucketStartMs);
-        const tfPrefixCandles = aggregateMinutesToTimeframeCandles(minutePrefixClosed);
+        const tfPrefixCandles = timeframeCandles.filter((tf) => tf.timestamp < bucketStartMs);
         const pending = strategy?.getPendingLevels
           ? strategy.getPendingLevels(tfPrefixCandles, strategyParams)
           : { buy: null, sell: null };
@@ -2386,7 +2389,19 @@ export default function App() {
       setMinuteDetailSource(null);
       setMinuteDetailLoading(false);
     });
-  }, [selectedTradeForDetail, selectedProviderId, selectedSymbol, symbolLabel, selectedInterval, selectedStrategyId, strategyParams]);
+  }, [minuteReplayTarget, selectedProviderId, selectedSymbol, symbolLabel, selectedInterval, selectedStrategyId, strategyParams]);
+
+  const handleTradeSelect = useCallback((trade) => {
+    setSelectedReplayCandle(null);
+    setSelectedTradeForDetail(trade);
+    setMinuteDetailVisible(true);
+  }, []);
+
+  const handleReplayCandleSelect = useCallback((candle) => {
+    setSelectedTradeForDetail(null);
+    setSelectedReplayCandle(candle);
+    setMinuteDetailVisible(true);
+  }, []);
 
   const pendingLevels = useMemo(() => {
     const s = STRATEGY_MAP[selectedStrategyId];
@@ -2518,6 +2533,7 @@ export default function App() {
           pivotHighTime={pivotLevels.pivotHighTime}
           pivotLowTime={pivotLevels.pivotLowTime}
           currentRvol={currentRvol}
+          onCandleClick={handleReplayCandleSelect}
         />
       </div>
 
@@ -2526,12 +2542,12 @@ export default function App() {
         <StrategyReport
           trades={displayTrades}
           strategyName={strategy.name}
-          onTradeSelect={setSelectedTradeForDetail}
+          onTradeSelect={handleTradeSelect}
           selectedTradeNumber={selectedTradeForDetail?.tradeNumber ?? null}
           detailPanel={
             minuteDetailVisible ? (
               <MinuteSimulationTable
-                selectedTrade={selectedTradeForDetail}
+                replayTarget={minuteReplayTarget}
                 rows={minuteDetailRows}
                 loading={minuteDetailLoading}
                 error={minuteDetailError}
