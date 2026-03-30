@@ -89,9 +89,20 @@ function formatDateTime(timestampMs) {
   });
 }
 
+/** Fraction digits by price magnitude (absolute value). */
+function getPriceDecimalsForValue(p) {
+  const x = Math.abs(Number(p));
+  if (!Number.isFinite(x)) return 2;
+  if (x >= 1000) return 0;
+  if (x >= 10) return 2;
+  if (x >= 1) return 3;
+  return 4;
+}
+
 function formatPrice(val) {
   if (val == null) return "—";
-  return val.toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+  const d = getPriceDecimalsForValue(val);
+  return val.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
 }
 
 function formatPnL(val, percent) {
@@ -723,6 +734,16 @@ function CandlestickChart({
   const [hoveredTime, setHoveredTime] = useState(null);
   const [activeTimeframe, setActiveTimeframe] = useState("5D");
 
+  const candleByTime = useMemo(() => {
+    const map = new Map();
+    for (const c of candles) map.set(c.time, c);
+    return map;
+  }, [candles]);
+
+  const hoveredCandle = hoveredTime != null ? candleByTime.get(hoveredTime) ?? null : null;
+  const displayBar = hoveredCandle ?? liveCandle ?? (candles.length > 0 ? candles[candles.length - 1] : null);
+  const referenceClose = displayBar?.close ?? null;
+
   // ── Init chart một lần ──────────────────────────────────────────────────────
   useEffect(() => {
     if (!containerRef.current) return;
@@ -1100,6 +1121,18 @@ function CandlestickChart({
     return () => ro.disconnect();
   }, []);
 
+  // Align candlestick price scale with reference close (same magnitude rules as formatPrice).
+  useEffect(() => {
+    const cs = candleSeriesRef.current;
+    if (!cs) return;
+    if (referenceClose == null || !Number.isFinite(referenceClose)) return;
+    const d = getPriceDecimalsForValue(referenceClose);
+    const minMove = d === 0 ? 1 : 10 ** (-d);
+    cs.applyOptions({
+      priceFormat: { type: "price", precision: d, minMove },
+    });
+  }, [referenceClose, overlayKey, candles.length]);
+
   // ── Timeframe buttons ────────────────────────────────────────────────────────
   const handleTimeframe = useCallback((tf) => {
     setActiveTimeframe(tf.label);
@@ -1117,14 +1150,6 @@ function CandlestickChart({
     chart.timeScale().setVisibleRange({ from: fromSec, to: nowSec });
   }, [candles]);
 
-  const candleByTime = useMemo(() => {
-    const map = new Map();
-    for (const c of candles) map.set(c.time, c);
-    return map;
-  }, [candles]);
-
-  const hoveredCandle = hoveredTime != null ? candleByTime.get(hoveredTime) ?? null : null;
-  const displayBar = hoveredCandle ?? liveCandle ?? (candles.length > 0 ? candles[candles.length - 1] : null);
   const barUp = displayBar ? displayBar.close >= displayBar.open : true;
   const barColor = barUp ? THEME.green : THEME.red;
   const rvolText =
@@ -1159,7 +1184,7 @@ function CandlestickChart({
           <div style={{ display: "flex", gap: 10, fontSize: 12, fontFamily: "'Source Code Pro', monospace" }}>
             {[["O", displayBar.open], ["H", displayBar.high], ["L", displayBar.low], ["C", displayBar.close]].map(([label, val]) => (
               <span key={label} style={{ color: THEME.textSecondary }}>
-                {label} <span style={{ color: barColor }}>{val?.toFixed(1)}</span>
+                {label} <span style={{ color: barColor }}>{formatPrice(val)}</span>
               </span>
             ))}
             {displayBar.volume != null && (
@@ -1469,11 +1494,12 @@ function EquityChart({ trades }) {
     return { x: toX(idx + 1), label }; // +1 vì equityData[0] là origin
   });
 
-  // Y-axis labels
+  // Y-axis labels (USDT — magnitude-based decimals)
+  const midPnL = (eqMax + eqMin) / 2;
   const yLabels = [
-    { v: eqMax, label: `${eqMax >= 0 ? "+" : ""}${eqMax.toFixed(0)}` },
-    { v: (eqMax + eqMin) / 2, label: `${((eqMax + eqMin) / 2) >= 0 ? "+" : ""}${((eqMax + eqMin) / 2).toFixed(0)}` },
-    { v: eqMin, label: `${eqMin >= 0 ? "+" : ""}${eqMin.toFixed(0)}` },
+    { v: eqMax, label: `${eqMax >= 0 ? "+" : ""}${formatPrice(eqMax)}` },
+    { v: midPnL, label: `${midPnL >= 0 ? "+" : ""}${formatPrice(midPnL)}` },
+    { v: eqMin, label: `${eqMin >= 0 ? "+" : ""}${formatPrice(eqMin)}` },
   ];
 
   // Hover: tìm điểm gần nhất theo X
@@ -1495,7 +1521,7 @@ function EquityChart({ trades }) {
   const tooltipLines = hovered?.trade
     ? [
         `Trade #${hovered.trade.tradeNumber} · ${hovered.trade.type}`,
-        `P&L: ${hovered.cumPnL >= 0 ? "+" : ""}${hovered.cumPnL.toFixed(1)} USDT`,
+        `P&L: ${hovered.cumPnL >= 0 ? "+" : ""}${formatPrice(hovered.cumPnL)} USDT`,
         formatDateTime(hovered.trade.exitTimestamp ?? hovered.trade.entryTimestamp),
       ]
     : [`Start`];
@@ -1619,9 +1645,9 @@ function ExcursionsChart({ trades }) {
     <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", display: "block" }}>
       {/* Y labels */}
       {[
-        { y: PAD.top,      label: `+${excMax.toFixed(0)}` },
+        { y: PAD.top,      label: `+${formatPrice(excMax)}` },
         { y: y0,           label: "0" },
-        { y: PAD.top + cH, label: `-${excMax.toFixed(0)}` },
+        { y: PAD.top + cH, label: `-${formatPrice(excMax)}` },
       ].map(({ y, label }) => (
         <g key={y}>
           <line x1={PAD.left} y1={y} x2={W - PAD.right} y2={y} stroke={y === y0 ? THEME.border : THEME.bgPrimary} strokeWidth="1" strokeDasharray={y === y0 ? "4,4" : "0"} />
