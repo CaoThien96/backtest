@@ -38,7 +38,7 @@ const THEME = {
   blue: "#2962ff",
 };
 
-const ASSET_OPTIONS = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE"];
+const ASSET_OPTIONS = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "LINK", "LTC", "SUI", "UNI"];
 const VISIBLE_PROVIDERS = PROVIDERS.filter((p) => p.id !== "kraken");
 // Provider-specific symbol mapping (used for REST/WS endpoints + cache keys)
 const ASSET_BY_PROVIDER_SYMBOL = {
@@ -49,6 +49,11 @@ const ASSET_BY_PROVIDER_SYMBOL = {
     SOL: "SOLUSDT",
     XRP: "XRPUSDT",
     DOGE: "DOGEUSDT",
+    ADA: "ADAUSDT",
+    LINK: "LINKUSDT",
+    LTC: "LTCUSDT",
+    SUI: "SUIUSDT",
+    UNI: "UNIUSDT",
   },
   coinbase: {
     BTC: "BTC-USD",
@@ -76,6 +81,16 @@ const ASSET_BY_PROVIDER_SYMBOL = {
 
 function getProviderSymbol(providerId, asset) {
   return ASSET_BY_PROVIDER_SYMBOL?.[providerId]?.[asset] ?? "BTCUSDT";
+}
+
+function getAvailableAssetsForProvider(providerId) {
+  const map = ASSET_BY_PROVIDER_SYMBOL?.[providerId] ?? {};
+  const assets = ASSET_OPTIONS.filter((asset) => Object.prototype.hasOwnProperty.call(map, asset));
+  return assets.length ? assets : ["BTC"];
+}
+
+function isQuotaExceededError(err) {
+  return err?.name === "QuotaExceededError" || err?.code === 22;
 }
 
 const PREFETCH_THRESHOLD = 50;
@@ -127,15 +142,20 @@ function calcDynamicRvolForMinuteRows(minuteCandles, timeframeCandles, entryStar
     .sort((a, b) => a.time - b.time);
   if (prevTfBars.length < lookback) return new Array(minuteCandles.length).fill(null);
 
-  const base = prevTfBars.slice(-lookback);
-  const avgVol = base.reduce((s, c) => s + (c?.volume ?? 0), 0) / lookback;
-  if (!(avgVol > 0)) return new Array(minuteCandles.length).fill(null);
+  // Match `computeRvol()` semantics in `src/strategies/prpPivotPsar.js`:
+  // - denominator avg window includes the current forming-bar volume
+  // - window = (lookback-1 previous bars) + (current forming cumulative volume)
+  const prevCount = Math.max(0, lookback - 1);
+  const prevSumVol = prevCount
+    ? prevTfBars.slice(-prevCount).reduce((s, c) => s + (c?.volume ?? 0), 0)
+    : 0;
 
   const out = new Array(minuteCandles.length).fill(null);
   let cumVol = 0;
   for (let i = 0; i < minuteCandles.length; i++) {
     cumVol += minuteCandles[i]?.volume ?? 0;
-    out[i] = cumVol / avgVol;
+    const avg = (prevSumVol + cumVol) / lookback;
+    out[i] = avg > 0 ? cumVol / avg : null;
   }
   return out;
 }
@@ -684,6 +704,7 @@ function CandlestickChart({
   selectedProviderId,
   onProviderChange,
   selectedAsset,
+  availableAssets,
   onAssetChange,
   symbolLabel,
   pendingBuy,
@@ -1175,7 +1196,7 @@ function CandlestickChart({
           onChange={(e) => onAssetChange?.(e.target.value)}
           style={{ background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "3px 8px", fontSize: 12, cursor: "pointer" }}
         >
-          {ASSET_OPTIONS.map((asset) => (
+          {availableAssets.map((asset) => (
             <option key={asset} value={asset}>{asset}</option>
           ))}
         </select>
@@ -2034,14 +2055,33 @@ export default function App() {
   const [selectedProviderId, setSelectedProviderId] = useState(DEFAULT_PROVIDER_ID);
   const [selectedInterval, setSelectedInterval] = useState("30");
   const SYMBOL_STORAGE_KEY = "tvbt_symbol_v1";
+  const pickFallbackAsset = useCallback((assets) => {
+    if (!assets.length) return "BTC";
+    return assets.includes("BTC") ? "BTC" : assets[0];
+  }, []);
   const [selectedAsset, setSelectedAsset] = useState(() => {
     try {
       const v = window?.localStorage?.getItem(SYMBOL_STORAGE_KEY);
-      return ASSET_OPTIONS.includes(v) ? v : "BTC";
+      const defaults = getAvailableAssetsForProvider(DEFAULT_PROVIDER_ID);
+      return defaults.includes(v) ? v : (defaults.includes("BTC") ? "BTC" : defaults[0]);
     } catch {
       return "BTC";
     }
   });
+  const availableAssetsForProvider = useMemo(
+    () => getAvailableAssetsForProvider(selectedProviderId),
+    [selectedProviderId]
+  );
+  useEffect(() => {
+    if (availableAssetsForProvider.includes(selectedAsset)) return;
+    const fallback = pickFallbackAsset(availableAssetsForProvider);
+    setSelectedAsset(fallback);
+    try {
+      window?.localStorage?.setItem(SYMBOL_STORAGE_KEY, fallback);
+    } catch {
+      // ignore
+    }
+  }, [availableAssetsForProvider, pickFallbackAsset, selectedAsset]);
   const selectedSymbol = getProviderSymbol(selectedProviderId, selectedAsset);
   const symbolLabel = selectedSymbol ?? "—";
 
@@ -2067,18 +2107,29 @@ export default function App() {
   }
 
   function saveStrategyParams(providerId, asset, strategyId, params) {
+    const key = makeStrategyParamsKey(providerId, asset, strategyId);
+    const value = JSON.stringify(params ?? {});
     try {
-      window?.localStorage?.setItem(
-        makeStrategyParamsKey(providerId, asset, strategyId),
-        JSON.stringify(params ?? {})
-      );
-    } catch {
+      window?.localStorage?.setItem(key, value);
+    } catch (err) {
+      // localStorage quota is usually consumed by candle cache; clear it and retry once.
+      if (isQuotaExceededError(err)) {
+        try {
+          window?.localStorage?.removeItem("tvbt_cache_v1");
+          window?.localStorage?.setItem(key, value);
+          return;
+        } catch {
+          // ignore secondary failure
+        }
+      }
       // ignore
     }
   }
 
   const handleAssetChange = (asset) => {
-    const next = ASSET_OPTIONS.includes(asset) ? asset : "BTC";
+    const next = availableAssetsForProvider.includes(asset)
+      ? asset
+      : pickFallbackAsset(availableAssetsForProvider);
     if (next === selectedAsset) return;
     setSelectedAsset(next);
     try {
@@ -2548,6 +2599,7 @@ export default function App() {
           selectedProviderId={selectedProviderId}
           onProviderChange={setSelectedProviderId}
           selectedAsset={selectedAsset}
+          availableAssets={availableAssetsForProvider}
           onAssetChange={handleAssetChange}
           symbolLabel={symbolLabel}
           pendingBuy={trades.length > 0 && trades[trades.length - 1].isOpen && trades[trades.length - 1].type === "Long" ? null : pendingLevels.buy}
