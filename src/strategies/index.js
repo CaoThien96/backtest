@@ -4,14 +4,12 @@
 
 import { PivotReversalStrategy }   from "./pivotReversal";
 import { PrpPivotPsarStrategy }    from "./prpPivotPsar";
-import { ChannelBreakoutStrategy } from "./channelBreakout";
-import { MomentumStrategy }        from "./momentum";
+import { PrpPivotPsarV2Strategy }  from "./prpPivotPsarV2";
 
 export const STRATEGIES = [
   PrpPivotPsarStrategy,
+  PrpPivotPsarV2Strategy,
   PivotReversalStrategy,
-  ChannelBreakoutStrategy,
-  MomentumStrategy,
 ];
 
 export const STRATEGY_MAP = Object.fromEntries(
