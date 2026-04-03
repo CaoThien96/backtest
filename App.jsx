@@ -4,6 +4,7 @@ import { STRATEGIES, STRATEGY_MAP, getDefaultParams } from "./src/strategies/ind
 import { runBacktest } from "./src/backtest/engine.js";
 import { getProvider, PROVIDERS, DEFAULT_PROVIDER_ID } from "./src/data/providers/index.js";
 import { getCandlesFromCache, upsertCandlesInCache, getCachedRange } from "./src/data/cache.js";
+import { calcDynamicRvolForMinuteRows } from "./src/utils/rvolDynamicMinute.js";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const TIMEFRAMES = [
@@ -132,32 +133,14 @@ function intervalToMinutes(interval) {
   return Number.isFinite(n) && n > 0 ? n : 15;
 }
 
-function calcDynamicRvolForMinuteRows(minuteCandles, timeframeCandles, entryStartMs, lookback) {
-  if (!lookback || lookback <= 0 || !minuteCandles.length || !timeframeCandles.length) {
-    return new Array(minuteCandles.length).fill(null);
-  }
+/** PRP variants share chart helpers (pivots, RVOL header, live candle extension). */
+function isPrpPivotFamily(id) {
+  return typeof id === "string" && id.startsWith("prp-pivot-psar");
+}
 
-  const prevTfBars = timeframeCandles
-    .filter((c) => c?.timestamp < entryStartMs)
-    .sort((a, b) => a.time - b.time);
-  if (prevTfBars.length < lookback) return new Array(minuteCandles.length).fill(null);
-
-  // Match `computeRvol()` semantics in `src/strategies/prpPivotPsar.js`:
-  // - denominator avg window includes the current forming-bar volume
-  // - window = (lookback-1 previous bars) + (current forming cumulative volume)
-  const prevCount = Math.max(0, lookback - 1);
-  const prevSumVol = prevCount
-    ? prevTfBars.slice(-prevCount).reduce((s, c) => s + (c?.volume ?? 0), 0)
-    : 0;
-
-  const out = new Array(minuteCandles.length).fill(null);
-  let cumVol = 0;
-  for (let i = 0; i < minuteCandles.length; i++) {
-    cumVol += minuteCandles[i]?.volume ?? 0;
-    const avg = (prevSumVol + cumVol) / lookback;
-    out[i] = avg > 0 ? cumVol / avg : null;
-  }
-  return out;
+/** Strategies that support async 1m RVOL repricing for entry price (Legacy vs Actual). */
+function needsPrpRvolReprice(id) {
+  return id === "prp-pivot-psar" || id === "prp-pivot-psar-v4";
 }
 
 function sortAndClipCandlesInRange(candles, startMs, endMs) {
@@ -522,16 +505,6 @@ function StrategyControls({
   onPositionSizeChange,
   feePct,
   onFeePctChange,
-  partialThresholdPct,
-  onPartialThresholdPctChange,
-  partialCloseRatioPct,
-  onPartialCloseRatioPctChange,
-  trailEnabled,
-  onTrailEnabledChange,
-  trailPct,
-  onTrailPctChange,
-  minFePct,
-  onMinFePctChange,
   prpEntryPriceMode,
   onPrpEntryPriceModeChange,
 }) {
@@ -577,75 +550,10 @@ function StrategyControls({
         />
       </label>
 
-      {/* Chốt lời: threshold % + tỷ lệ chốt % */}
-      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: THEME.textSecondary }}>
-        Chốt lời khi lời (%)
-        <input
-          type="number"
-          value={partialThresholdPct}
-          min={0}
-          max={100}
-          step={0.1}
-          onChange={(e) => onPartialThresholdPctChange(Math.max(0, Number(e.target.value)))}
-          style={{ width: 52, background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 12, textAlign: "center" }}
-        />
-      </label>
-      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: THEME.textSecondary }}>
-        Tỷ lệ chốt (%)
-        <input
-          type="number"
-          value={partialCloseRatioPct}
-          min={0}
-          max={100}
-          step={1}
-          onChange={(e) => onPartialCloseRatioPctChange(Math.max(0, Math.min(100, Number(e.target.value))))}
-          style={{ width: 52, background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 12, textAlign: "center" }}
-        />
-      </label>
-
       {/* Divider */}
       <div style={{ width: 1, height: 14, background: THEME.border }} />
 
-      {/* Trailing Stop */}
-      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: THEME.textSecondary, cursor: "pointer" }}>
-        <input
-          type="checkbox"
-          checked={trailEnabled}
-          onChange={(e) => onTrailEnabledChange(e.target.checked)}
-          style={{ accentColor: THEME.blue, cursor: "pointer" }}
-        />
-        Trail %
-      </label>
-      {trailEnabled && (
-        <>
-          <input
-            type="number"
-            value={trailPct}
-            min={0.1}
-            max={99}
-            step={0.1}
-            onChange={(e) => onTrailPctChange(Math.max(0.1, Math.min(99, Number(e.target.value))))}
-            style={{ width: 44, background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 12, textAlign: "center" }}
-          />
-          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: THEME.textSecondary }}>
-            Min FE%
-            <input
-              type="number"
-              value={minFePct}
-              min={0.1}
-              max={50}
-              step={0.1}
-              onChange={(e) => onMinFePctChange(Math.max(0.1, Number(e.target.value)))}
-              style={{ width: 44, background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 12, textAlign: "center" }}
-            />
-          </label>
-        </>
-      )}
-
-      {/* Divider */}
-      <div style={{ width: 1, height: 14, background: THEME.border }} />
-
-      {selectedId === "prp-pivot-psar" && (
+      {(selectedId === "prp-pivot-psar" || selectedId === "prp-pivot-psar-v4") && (
         <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: THEME.textSecondary }}>
           Entry Price Mode
           <select
@@ -659,7 +567,7 @@ function StrategyControls({
         </label>
       )}
 
-      {selectedId === "prp-pivot-psar" && <div style={{ width: 1, height: 14, background: THEME.border }} />}
+      {(selectedId === "prp-pivot-psar" || selectedId === "prp-pivot-psar-v4") && <div style={{ width: 1, height: 14, background: THEME.border }} />}
 
       {/* Auto-generated param inputs */}
       {Object.entries(strategy.paramSchema).map(([key, schema]) => (
@@ -1927,129 +1835,6 @@ function ErrorState({ message, onRetry }) {
   );
 }
 
-// ─── Trailing Stop Simulator (bar-by-bar, Bybit-standard) ────────────────────
-// Bybit formula:
-//   Long:  trailStopPrice = highestPrice × (1 - trailPct/100)
-//   Short: trailStopPrice = lowestPrice  × (1 + trailPct/100)
-// Activation: trail only arms after price moves minFePct% favorably from entry.
-// Returns simulated exit P&L in USDT, or null if trail never triggered.
-function simulateTrailingStop(trade, allCandles, trailPct, minFePct, feePctPerSide) {
-  const { entryBarIndex, exitBarIndex, entryPrice, positionSize, positionValue } = trade;
-  if (entryBarIndex == null || exitBarIndex == null) return null;
-
-  const isLong          = trade.type === "Long";
-  const trailMult       = trailPct / 100;
-  // Activation price: price must reach this level before trail arms
-  const activationPrice = isLong
-    ? entryPrice * (1 + minFePct / 100)
-    : entryPrice * (1 - minFePct / 100);
-
-  let peakPrice   = entryPrice; // highest (long) or lowest (short) price seen
-  let trailActive = false;
-
-  for (let i = entryBarIndex; i < exitBarIndex; i++) {
-    const bar = allCandles[i];
-    if (!bar) break;
-
-    // 1. Update peak price
-    if (isLong) {
-      peakPrice = Math.max(peakPrice, bar.high);
-      if (!trailActive && peakPrice >= activationPrice) trailActive = true;
-    } else {
-      peakPrice = Math.min(peakPrice, bar.low);
-      if (!trailActive && peakPrice <= activationPrice) trailActive = true;
-    }
-
-    // 2. Check if trail stop triggered (with gap protection)
-    if (trailActive) {
-      if (isLong) {
-        const trailStopPrice = peakPrice * (1 - trailMult);
-        if (bar.low <= trailStopPrice) {
-          const exitPrice = Math.min(bar.open, trailStopPrice); // gap protection
-          const gross = (exitPrice - entryPrice) * positionSize;
-          const feeOpen  = positionValue * feePctPerSide;
-          const feeClose = positionValue * feePctPerSide;
-          return gross - feeOpen - feeClose;
-        }
-      } else {
-        const trailStopPrice = peakPrice * (1 + trailMult);
-        if (bar.high >= trailStopPrice) {
-          const exitPrice = Math.max(bar.open, trailStopPrice); // gap protection
-          const gross = (entryPrice - exitPrice) * positionSize;
-          const feeOpen  = positionValue * feePctPerSide;
-          const feeClose = positionValue * feePctPerSide;
-          return gross - feeOpen - feeClose;
-        }
-      }
-    }
-  }
-
-  return null; // trail never triggered — keep actual netPnL
-}
-
-// ─── Partial Take Profit (chốt lời) Simulator ─────────────────────────────────
-// When unrealized profit >= thresholdPct%, close closeRatioPct% at threshold price,
-// then run remainder with stop at entry (breakeven). Returns { netPnL } or null.
-function simulatePartialTakeProfit(trade, allCandles, thresholdPct, closeRatioPct, feePctPerSide) {
-  const { entryBarIndex, exitBarIndex, entryPrice, positionSize, type, exitPrice: originalExitPrice, positionValue } = trade;
-  if (entryBarIndex == null || exitBarIndex == null || thresholdPct <= 0 || closeRatioPct <= 0 || closeRatioPct > 100) return null;
-
-  const isLong = trade.type === "Long";
-  const thresholdPrice = isLong
-    ? entryPrice * (1 + thresholdPct / 100)
-    : entryPrice * (1 - thresholdPct / 100);
-
-  for (let i = entryBarIndex + 1; i <= exitBarIndex; i++) {
-    const bar = allCandles[i];
-    if (!bar) break;
-
-    const profitPct = isLong
-      ? ((bar.high - entryPrice) / entryPrice) * 100
-      : ((entryPrice - bar.low) / entryPrice) * 100;
-
-    if (profitPct < thresholdPct) continue;
-
-    // First bar where threshold reached: partial close at threshold price
-    const partialSize = positionSize * (closeRatioPct / 100);
-    const remainderSize = positionSize * (1 - closeRatioPct / 100);
-    const partialPnL = isLong
-      ? (thresholdPrice - entryPrice) * partialSize
-      : (entryPrice - thresholdPrice) * partialSize;
-
-    // Remainder: same bar then i+1..exitBarIndex — breakeven at entry or original exit
-    const hitEntry = (b) => (isLong ? b.low <= entryPrice : b.high >= entryPrice);
-    let remainderExitPrice = null;
-
-    if (hitEntry(bar)) {
-      remainderExitPrice = entryPrice;
-    } else {
-      for (let j = i + 1; j <= exitBarIndex; j++) {
-        const b = allCandles[j];
-        if (!b) break;
-        if (hitEntry(b)) {
-          remainderExitPrice = entryPrice;
-          break;
-        }
-      }
-      if (remainderExitPrice === null) {
-        const lastBar = allCandles[exitBarIndex];
-        remainderExitPrice = originalExitPrice ?? lastBar?.close ?? entryPrice;
-      }
-    }
-
-    const remainderPnL = isLong
-      ? (remainderExitPrice - entryPrice) * remainderSize
-      : (entryPrice - remainderExitPrice) * remainderSize;
-
-    const gross = partialPnL + remainderPnL;
-    const feeOpen  = positionValue * feePctPerSide;
-    const feeClose = positionValue * feePctPerSide;
-    return { netPnL: gross - feeOpen - feeClose };
-  }
-
-  return null; // threshold never reached — keep original trade
-}
-
 // ─── App root ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [selectedProviderId, setSelectedProviderId] = useState(DEFAULT_PROVIDER_ID);
@@ -2150,11 +1935,6 @@ export default function App() {
   });
   const [positionSize, setPositionSize] = useState(5000);
   const [feePct, setFeePct]             = useState(0.05); // % per side (open and close)
-  const [trailEnabled, setTrailEnabled] = useState(false);
-  const [trailPct, setTrailPct]         = useState(10);
-  const [minFePct, setMinFePct]         = useState(1); // min FE% of position to activate trail
-  const [partialThresholdPct, setPartialThresholdPct] = useState(0);
-  const [partialCloseRatioPct, setPartialCloseRatioPct] = useState(50);
   const [prpEntryPriceMode, setPrpEntryPriceMode] = useState("Legacy");
   const [selectedTradeForDetail, setSelectedTradeForDetail] = useState(null);
   const [selectedReplayCandle, setSelectedReplayCandle] = useState(null);
@@ -2168,6 +1948,8 @@ export default function App() {
   const minuteRangeCacheRef = useRef(new Map());
   const minuteDetailReqRef = useRef(0);
   const [repricedPrpSignals, setRepricedPrpSignals] = useState(null);
+  const [prpV5MinuteCandles, setPrpV5MinuteCandles] = useState([]);
+  const [prpV5MinuteStatus, setPrpV5MinuteStatus] = useState("idle");
   const skipPersistRef = useRef(false);
 
   const minuteReplayTarget = useMemo(() => {
@@ -2231,7 +2013,7 @@ export default function App() {
 
   useEffect(() => {
     const strategy = STRATEGY_MAP[selectedStrategyId];
-    if (!strategy || selectedStrategyId !== "prp-pivot-psar" || !allCandlesForBacktest.length) {
+    if (!strategy || !needsPrpRvolReprice(selectedStrategyId) || !allCandlesForBacktest.length) {
       setRepricedPrpSignals(null);
       return;
     }
@@ -2313,58 +2095,89 @@ export default function App() {
     prpEntryPriceMode,
   ]);
 
+  // Preload 1m candles for PRP v5 intrabar backtest
+  useEffect(() => {
+    if (selectedStrategyId !== "prp-pivot-psar-v5") {
+      setPrpV5MinuteCandles([]);
+      setPrpV5MinuteStatus("idle");
+      return;
+    }
+    if (!allCandlesForBacktest.length) {
+      setPrpV5MinuteCandles([]);
+      setPrpV5MinuteStatus("idle");
+      return;
+    }
+
+    let cancelled = false;
+    const first = allCandlesForBacktest[0];
+    const last = allCandlesForBacktest[allCandlesForBacktest.length - 1];
+    const tfMs = intervalToMinutes(selectedInterval) * 60 * 1000;
+    const startMs = first.timestamp;
+    const endMs = last.timestamp + tfMs;
+    setPrpV5MinuteStatus("loading");
+
+    (async () => {
+      try {
+        const { candles: minuteCandles } = await loadMinuteRangeCached({
+          providerId: selectedProviderId,
+          symbol: selectedSymbol,
+          startMs,
+          endMs,
+          inMemoryRef: minuteRangeCacheRef,
+        });
+        if (cancelled) return;
+        const rows = minuteCandles ?? [];
+        setPrpV5MinuteCandles(rows);
+        setPrpV5MinuteStatus(rows.length ? "ready" : "error");
+      } catch {
+        if (!cancelled) {
+          setPrpV5MinuteCandles([]);
+          setPrpV5MinuteStatus("error");
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedStrategyId, allCandlesForBacktest, selectedInterval, selectedProviderId, selectedSymbol]);
+
   // Chạy backtest mỗi khi confirmed candles hoặc throttled live candle thay đổi
   const trades = useMemo(() => {
     const allCandles = allCandlesForBacktest;
     if (allCandles.length === 0) return [];
     const strategy = STRATEGY_MAP[selectedStrategyId];
-    const sigs = selectedStrategyId === "prp-pivot-psar" && repricedPrpSignals?.length
+    if (selectedStrategyId === "prp-pivot-psar-v5") {
+      if (prpV5MinuteStatus !== "ready" || !prpV5MinuteCandles.length) {
+        return [];
+      }
+      const tfMinutes = intervalToMinutes(selectedInterval);
+      const sigs = strategy.generateSignals(allCandles, strategyParams, {
+        minuteCandles: prpV5MinuteCandles,
+        tfMinutes,
+      });
+      return runBacktest(allCandles, sigs, { positionSizeUSDT: positionSize, feePct: feePct / 100 });
+    }
+    const useRepriced = needsPrpRvolReprice(selectedStrategyId) && repricedPrpSignals?.length;
+    const sigs = useRepriced
       ? repricedPrpSignals
       : strategy.generateSignals(allCandles, strategyParams);
     return runBacktest(allCandles, sigs, { positionSizeUSDT: positionSize, feePct: feePct / 100 });
-  }, [allCandlesForBacktest, selectedStrategyId, strategyParams, positionSize, feePct, repricedPrpSignals]);
-
-  const partialEnabled = partialThresholdPct > 0 && partialCloseRatioPct > 0 && partialCloseRatioPct <= 100;
+  }, [
+    allCandlesForBacktest,
+    selectedStrategyId,
+    strategyParams,
+    positionSize,
+    feePct,
+    repricedPrpSignals,
+    prpV5MinuteCandles,
+    prpV5MinuteStatus,
+    selectedInterval,
+  ]);
 
   const displayTrades = useMemo(() => {
-    if (trades.length === 0) return trades;
-    const allCandles = liveCandleForBacktest ? [...candles, liveCandleForBacktest] : candles;
-    const initialCapital = trades[0].positionValue;
-
-    if (partialEnabled) {
-      let cumPnL = 0;
-      return trades.map((t) => {
-        const result = simulatePartialTakeProfit(t, allCandles, partialThresholdPct, partialCloseRatioPct, feePct / 100);
-        const simPnL = result != null ? result.netPnL : t.netPnL;
-        cumPnL += simPnL;
-        return {
-          ...t,
-          netPnL:               simPnL,
-          netPnLPercent:        (simPnL / t.positionValue) * 100,
-          cumulativePnL:        cumPnL,
-          cumulativePnLPercent: (cumPnL / initialCapital) * 100,
-        };
-      });
-    }
-
-    if (trailEnabled) {
-      let cumPnL = 0;
-      return trades.map((t) => {
-        const trailPnL = simulateTrailingStop(t, allCandles, trailPct, minFePct, feePct / 100);
-        const simPnL   = trailPnL !== null ? trailPnL : t.netPnL;
-        cumPnL += simPnL;
-        return {
-          ...t,
-          netPnL:               simPnL,
-          netPnLPercent:        (simPnL / t.positionValue) * 100,
-          cumulativePnL:        cumPnL,
-          cumulativePnLPercent: (cumPnL / initialCapital) * 100,
-        };
-      });
-    }
-
     return trades;
-  }, [trades, partialEnabled, partialThresholdPct, partialCloseRatioPct, trailEnabled, trailPct, minFePct, candles, liveCandleForBacktest]);
+  }, [trades]);
 
   useEffect(() => {
     if (!minuteReplayTarget) {
@@ -2495,7 +2308,7 @@ export default function App() {
     if (!strategy?.getCurrentPivots) {
       return { pivotHigh: null, pivotLow: null, pivotHighTime: null, pivotLowTime: null };
     }
-    const candlesForPivots = strategy.id === "prp-pivot-psar" && liveCandleForBacktest
+    const candlesForPivots = isPrpPivotFamily(strategy.id) && liveCandleForBacktest
       ? [...candles, liveCandleForBacktest]
       : candles;
     if (!candlesForPivots.length) {
@@ -2525,7 +2338,7 @@ export default function App() {
     // For PRP strategy: if current StopLoss is beyond the opposite pending
     // stop entry level, it will never be hit (reversal happens first), so we
     // hide the SL line to avoid visual clutter.
-    if (selectedStrategyId === "prp-pivot-psar") {
+    if (isPrpPivotFamily(selectedStrategyId)) {
       const pendingBuy = pendingLevels.buy;
       const pendingSell = pendingLevels.sell;
       if (openTrade.type === "Long" && typeof stopLoss === "number" && typeof pendingSell === "number") {
@@ -2548,7 +2361,7 @@ export default function App() {
   const currentRvol = useMemo(() => {
     const strategy = STRATEGY_MAP[selectedStrategyId];
     if (!strategy?.getCurrentRvol) return null;
-    const candlesForRvol = strategy.id === "prp-pivot-psar" && liveCandleForBacktest
+    const candlesForRvol = isPrpPivotFamily(strategy.id) && liveCandleForBacktest
       ? [...candles, liveCandleForBacktest]
       : candles;
     return strategy.getCurrentRvol(candlesForRvol, strategyParams);
@@ -2571,16 +2384,6 @@ export default function App() {
         onPositionSizeChange={setPositionSize}
         feePct={feePct}
         onFeePctChange={setFeePct}
-        partialThresholdPct={partialThresholdPct}
-        onPartialThresholdPctChange={setPartialThresholdPct}
-        partialCloseRatioPct={partialCloseRatioPct}
-        onPartialCloseRatioPctChange={setPartialCloseRatioPct}
-        trailEnabled={trailEnabled}
-        onTrailEnabledChange={setTrailEnabled}
-        trailPct={trailPct}
-        onTrailPctChange={setTrailPct}
-        minFePct={minFePct}
-        onMinFePctChange={setMinFePct}
         prpEntryPriceMode={prpEntryPriceMode}
         onPrpEntryPriceModeChange={setPrpEntryPriceMode}
       />

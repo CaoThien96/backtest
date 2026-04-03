@@ -108,7 +108,11 @@ function buildTrade({
 function checkSLTP(candles, position, upToBarIndex) {
   const { type, entryBarIndex, stopLoss, takeProfit, exitFn } = position;
   if (!stopLoss && !takeProfit && !exitFn) return null;
-  for (let i = entryBarIndex + 1; i < upToBarIndex; i++) {
+  // When the next signal is on the bar immediately after entry (upToBarIndex === entryBarIndex + 1),
+  // the naive bound `i < upToBarIndex` would scan nothing — we must still evaluate that bar for SL/TP.
+  // For later signals, `Math.max(upToBarIndex, entryBarIndex + 2)` reduces to `upToBarIndex` (unchanged range).
+  const endExclusive = Math.max(upToBarIndex, entryBarIndex + 2);
+  for (let i = entryBarIndex + 1; i < endExclusive && i < candles.length; i++) {
     const bar = candles[i];
     // Dynamic exit (e.g. PSAR trailing stop) — takes priority over fixed SL/TP
     if (exitFn) {
@@ -202,7 +206,7 @@ export function runBacktest(candles, signals, { positionSizeUSDT = 10000, feePct
         entryBarIndex: signal.barIndex,
         entryPrice: signal.entryPrice,
         entrySignal: signal.label,
-        entryTimestamp: bar.timestamp, // ms
+        entryTimestamp: signal.timestamp ?? bar.timestamp, // ms (intrabar strategies may set per-minute ts)
         stopLoss:   signal.stopLoss   ?? null,
         takeProfit: signal.takeProfit ?? null,
         exitFn:     signal.exitFn     ?? null,

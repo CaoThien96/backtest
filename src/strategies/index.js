@@ -4,11 +4,9 @@
 
 import { PivotReversalStrategy }   from "./pivotReversal";
 import { PrpPivotPsarStrategy }    from "./prpPivotPsar";
-import { PrpPivotPsarV2Strategy }  from "./prpPivotPsarV2";
 
 export const STRATEGIES = [
   PrpPivotPsarStrategy,
-  PrpPivotPsarV2Strategy,
   PivotReversalStrategy,
 ];
 
