@@ -5,6 +5,7 @@ import { runBacktest } from "./src/backtest/engine.js";
 import { getProvider, PROVIDERS, DEFAULT_PROVIDER_ID } from "./src/data/providers/index.js";
 import { getCandlesFromCache, upsertCandlesInCache, getCachedRange } from "./src/data/cache.js";
 import { calcDynamicRvolForMinuteRows } from "./src/utils/rvolDynamicMinute.js";
+import { buildFormingTfCandle, getBodyBias } from "./src/utils/formingTfBodyBias.js";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const TIMEFRAMES = [
@@ -1343,7 +1344,7 @@ function MinuteSimulationTable({ replayTarget, rows, loading, error, sourceLabel
       <table style={{ width: "100%", borderCollapse: "collapse", tableLayout: "fixed" }}>
         <thead>
           <tr>
-            {["Time", "Current Price", "RVol", "Stop Sell At", "Stop Buy At"].map((h) => (
+            {["Time", "Current Price", "RVol", "BB Long", "BB Short", "Stop Sell At", "Stop Buy At"].map((h) => (
               <th key={h} style={{ textAlign: "left", fontSize: 11, padding: "5px 8px", color: THEME.textSecondary, borderBottom: `1px solid ${THEME.border}` }}>{h}</th>
             ))}
           </tr>
@@ -1351,7 +1352,7 @@ function MinuteSimulationTable({ replayTarget, rows, loading, error, sourceLabel
         <tbody>
           {rows.length === 0 && (
             <tr>
-              <td colSpan={5} style={{ padding: "8px", color: THEME.textSecondary, fontSize: 12 }}>
+              <td colSpan={7} style={{ padding: "8px", color: THEME.textSecondary, fontSize: 12 }}>
                 No minute candles available in selected window.
               </td>
             </tr>
@@ -1361,6 +1362,8 @@ function MinuteSimulationTable({ replayTarget, rows, loading, error, sourceLabel
               <td style={{ padding: "4px 8px", fontSize: 11, color: THEME.textPrimary }}>{formatDateTime(r.timeMs)}</td>
               <td style={{ padding: "4px 8px", fontSize: 11, color: THEME.textPrimary }}>{formatPrice(r.currentPrice)}</td>
               <td style={{ padding: "4px 8px", fontSize: 11, color: THEME.textPrimary }}>{r.rvol == null ? "—" : r.rvol.toFixed(2)}</td>
+              <td style={{ padding: "4px 8px", fontSize: 11, color: THEME.green }}>{r.bodyBiasLong == null ? "—" : r.bodyBiasLong.toFixed(3)}</td>
+              <td style={{ padding: "4px 8px", fontSize: 11, color: THEME.red }}>{r.bodyBiasShort == null ? "—" : r.bodyBiasShort.toFixed(3)}</td>
               <td style={{ padding: "4px 8px", fontSize: 11, color: THEME.red }}>{r.stopSellAt == null ? "—" : formatPrice(r.stopSellAt)}</td>
               <td style={{ padding: "4px 8px", fontSize: 11, color: THEME.green }}>{r.stopBuyAt == null ? "—" : formatPrice(r.stopBuyAt)}</td>
             </tr>
@@ -1933,7 +1936,7 @@ export default function App() {
     const stored = loadStrategyParams(selectedProviderId, selectedAsset, initialStrategyId);
     return stored ?? getDefaultParams(STRATEGIES[0]);
   });
-  const [positionSize, setPositionSize] = useState(5000);
+  const [positionSize, setPositionSize] = useState(2000);
   const [feePct, setFeePct]             = useState(0.05); // % per side (open and close)
   const [prpEntryPriceMode, setPrpEntryPriceMode] = useState("Legacy");
   const [selectedTradeForDetail, setSelectedTradeForDetail] = useState(null);
@@ -2258,10 +2261,15 @@ export default function App() {
           ? strategy.getPendingLevels(tfPrefixCandles, strategyParams)
           : { buy: null, sell: null };
         const rvol = dynamicRvolArr[i];
+        const forming = buildFormingTfCandle(minuteCandles, 0, i);
+        const bodyBiasLong = forming ? getBodyBias("long", forming) : null;
+        const bodyBiasShort = forming ? getBodyBias("short", forming) : null;
         return {
           timeMs: c.timestamp,
           currentPrice: c.close,
           rvol,
+          bodyBiasLong,
+          bodyBiasShort,
           stopSellAt: typeof pending.sell === "number" && Number.isFinite(pending.sell) ? pending.sell : null,
           stopBuyAt: typeof pending.buy === "number" && Number.isFinite(pending.buy) ? pending.buy : null,
         };

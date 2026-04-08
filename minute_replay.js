@@ -4,12 +4,13 @@ import path from "node:path";
 import process from "node:process";
 
 import { calcDynamicRvolForMinuteRows } from "./src/utils/rvolDynamicMinute.js";
+import { buildFormingTfCandle, getBodyBias } from "./src/utils/formingTfBodyBias.js";
 import { PrpPivotPsarStrategy } from "./src/strategies/prpPivotPsar.js";
 
 function parseArgs(argv) {
   const out = {
-    trades: "./trades.json",
-    params: "./prp_params.json",
+    trades: "./trades_sol.json",
+    params: "./sol_params.json",
     provider: "bybit",
     symbol: "SOLUSDT",
     tfMinutes: 30,
@@ -95,9 +96,10 @@ minute_replay.js
 
 Replays each PRP trade inside its TF bucket using 1m candles to find the first minute where:
   - dynamic RVOL >= rvolMin
-  - minute.close crosses triggerLevel (breakout=close)
+  - optional direction confirm on the cumulative forming TF candle (params: directionConfirmMode / minBodyBias):
+      None | Candle Color | Body Bias (same semantics as PRP on the intrabar-formed OHLC)
 
-Then recomputes PnL with the new entry price and prints Old vs New metrics.
+Then recomputes PnL with the new entry price (OHLC4 at breakout minute) and prints Old vs New metrics.
 
 Usage:
   node ./minute_replay.js --trades ./trades.json --params ./prp_params.json
@@ -290,11 +292,38 @@ function classifyEntryQuality(side, oldEntry, newEntry, eps = 1e-9) {
   return newEntry > oldEntry ? "better" : "worse";
 }
 
+function getEntryDistancePctText(side, oldEntry, newEntry) {
+  if (![oldEntry, newEntry].every((v) => typeof v === "number" && Number.isFinite(v)) || oldEntry === 0) {
+    return "—";
+  }
+  const rawPct = ((newEntry - oldEntry) / oldEntry) * 100;
+  const beneficialPct = side === "long" ? -rawPct : rawPct;
+  const sign = beneficialPct >= 0 ? "+" : "-";
+  return `${sign}${Math.abs(beneficialPct).toFixed(3)}%`;
+}
+
 function getOhlc4(candle) {
   if (!candle) return null;
   const { open, high, low, close } = candle;
   if (![open, high, low, close].every((v) => typeof v === "number" && Number.isFinite(v))) return null;
   return (open + high + low + close) / 4;
+}
+
+/** Direction confirm on cumulative forming TF candle (open = first minute, high/low running, close = current minute). */
+function passesFormingDirectionConfirm(type, formingCandle, mode, minBodyBias) {
+  const m = mode ?? "None";
+  if (m === "None") return true;
+  if (!formingCandle) return false;
+  const { open, close, high, low } = formingCandle;
+  if (![open, close, high, low].every((v) => typeof v === "number" && Number.isFinite(v))) return false;
+  if (m === "Candle Color") {
+    return type === "long" ? close >= open : close <= open;
+  }
+  if (m === "Body Bias") {
+    const threshold = Math.max(0, Math.min(1, Number(minBodyBias ?? 0)));
+    return getBodyBias(type, formingCandle) >= threshold;
+  }
+  return true;
 }
 
 function looksLikeWrongSymbol(oldEntry, newEntry) {
@@ -403,6 +432,13 @@ async function main() {
   const lookback = Number(strategyParams.rvolLookback ?? 0);
   const rvolMin = Number(strategyParams.rvolMin ?? 0);
   const tick = Number(strategyParams.minTick ?? 0);
+  const directionConfirmMode = strategyParams.directionConfirmMode ?? "None";
+  const minBodyBias = Number(strategyParams.minBodyBias ?? 0);
+
+  console.log(
+    `Replay gates: RVOL>=${rvolMin} (lookback=${lookback}) · directionConfirmMode=${directionConfirmMode}` +
+    (directionConfirmMode === "Body Bias" ? ` (minBodyBias=${minBodyBias})` : "")
+  );
 
   /** @type {Array<number>} */
   const oldPnls = [];
@@ -469,16 +505,27 @@ async function main() {
     const tfCandlesForRvol = tfCandles.filter((c) => c.timestamp < bucketStart).sort((a, b) => a.time - b.time);
     const rvolArr = calcDynamicRvolForMinuteRows(minuteCandles, tfCandlesForRvol, bucketStart, lookback);
 
-    // Step A: RVOL breakout is the first minute where RVOL >= minRvol (no price condition).
+    // Step A: first minute where RVOL >= rvolMin AND forming-TF direction confirm (if enabled).
     let breakoutIdx = -1;
+    let maxBodyBiasLong = 0;
+    let maxBodyBiasShort = 0;
     for (let i = 0; i < minuteCandles.length; i++) {
       const m = minuteCandles[i];
       const rvol = rvolArr[i];
       const rvolOk = rvol != null && rvol >= rvolMin;
+      const formingTf = buildFormingTfCandle(minuteCandles, 0, i);
+      const bodyBiasLong = getBodyBias("long", formingTf);
+      const bodyBiasShort = getBodyBias("short", formingTf);
+      if (bodyBiasLong > maxBodyBiasLong) maxBodyBiasLong = bodyBiasLong;
+      if (bodyBiasShort > maxBodyBiasShort) maxBodyBiasShort = bodyBiasShort;
+      const dirOk = passesFormingDirectionConfirm(side, formingTf, directionConfirmMode, minBodyBias);
       if (opt.verbose) {
-        console.log(`  scanRvol ${toIso(m.timestamp)} close=${m.close} rvol=${rvol} rvolOk=${rvolOk}`);
+        console.log(
+          `  scanBreakout ${toIso(m.timestamp)} close=${m.close} rvol=${rvol} rvolOk=${rvolOk} ` +
+          `dirOk=${dirOk} mode=${directionConfirmMode} bodyBiasLong=${bodyBiasLong} bodyBiasShort=${bodyBiasShort}`
+        );
       }
-      if (rvolOk) {
+      if (rvolOk && dirOk) {
         breakoutIdx = i;
         break;
       }
@@ -487,20 +534,30 @@ async function main() {
     if (breakoutIdx < 0) {
       const dbg = computeBucketDebugStats(minuteCandles, rvolArr);
       console.log(
-        `  RVOL breakout not found debug: triggerLevel=${triggerLevel} rvolMin=${rvolMin} lookback=${lookback} ` +
+        `  RVOL/direction breakout not found debug: triggerLevel=${triggerLevel} rvolMin=${rvolMin} lookback=${lookback} ` +
+        `directionConfirmMode=${directionConfirmMode} minBodyBias=${minBodyBias} ` +
         `maxRvolInBucket=${dbg.maxRvolInBucket} nonNullRvolRows=${dbg.nonNullRvolRows} ` +
-        `maxClose=${dbg.maxClose} minClose=${dbg.minClose}`
+        `maxClose=${dbg.maxClose} minClose=${dbg.minClose} ` +
+        `maxBodyBiasLong=${maxBodyBiasLong} maxBodyBiasShort=${maxBodyBiasShort}`
       );
     }
 
-    // Step B: entry price is the CLOSE price at RVOL breakout minute.
-    let entryHit = null; // { entryPrice, timestamp, breakoutTimestamp, rvolAtBreakout }
+    // Step B: entry price is OHLC4 at breakout minute (fallback: close).
+    let entryHit = null; // { entryPrice, timestamp, breakoutTimestamp, rvolAtBreakout, bodyBiasAtBreakout }
     if (breakoutIdx >= 0) {
       const breakoutTimestamp = minuteCandles[breakoutIdx].timestamp;
       const rvolAtBreakout = rvolArr[breakoutIdx];
+      const formingAtBreakout = buildFormingTfCandle(minuteCandles, 0, breakoutIdx);
+      const bodyBiasAtBreakout = formingAtBreakout ? getBodyBias(side, formingAtBreakout) : null;
       const breakoutOhlc4 = getOhlc4(minuteCandles[breakoutIdx]);
       const entryPrice = breakoutOhlc4 != null ? breakoutOhlc4 : minuteCandles[breakoutIdx].close;
-      entryHit = { entryPrice, timestamp: breakoutTimestamp, breakoutTimestamp, rvolAtBreakout };
+      entryHit = {
+        entryPrice,
+        timestamp: breakoutTimestamp,
+        breakoutTimestamp,
+        rvolAtBreakout,
+        bodyBiasAtBreakout,
+      };
     }
 
     const newEntryPrice = entryHit?.entryPrice ?? t.entryPrice;
@@ -525,13 +582,20 @@ async function main() {
     oldPnls.push(oldNet);
     newPnls.push(newNet);
     const quality = classifyEntryQuality(side, t.entryPrice, safeNewEntryPrice);
+    const entryDeltaPctText = getEntryDistancePctText(side, t.entryPrice, safeNewEntryPrice);
     if (quality === "better") betterEntryCount++;
     else if (quality === "worse") worseEntryCount++;
     else sameEntryCount++;
 
     console.log(
       `  Found=${entryHit ? toIso(entryHit.timestamp) : "—"} breakout=${entryHit ? toIso(entryHit.breakoutTimestamp) : "—"} ` +
-      `rvolAtBreakout=${entryHit?.rvolAtBreakout ?? "—"} oldEntry=${t.entryPrice} newEntry=${newEntryPrice} ` +
+      `rvolAtBreakout=${entryHit?.rvolAtBreakout ?? "—"} ` +
+      `bodyBiasAtBreakout=${
+        entryHit?.bodyBiasAtBreakout != null && Number.isFinite(entryHit.bodyBiasAtBreakout)
+          ? entryHit.bodyBiasAtBreakout.toFixed(3)
+          : "—"
+      } ` +
+      `oldEntry=${t.entryPrice} newEntry=${newEntryPrice} entryDelta=${entryDeltaPctText} ` +
       `oldPnL=${oldNet.toFixed(2)} newPnL=${newNet.toFixed(2)}`
     );
 

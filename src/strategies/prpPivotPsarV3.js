@@ -104,7 +104,7 @@ function getPivotHigh(candles, i, leftBars, rightBars) {
     if (candles[j].high >= pivotHigh) return null;
   }
   for (let j = pivotIdx + 1; j <= i; j++) {
-    if (candles[j].high >= pivotHigh) return null;
+    if (candles[j].high > pivotHigh) return null;
   }
   return pivotHigh;
 }
@@ -117,7 +117,7 @@ function getPivotLow(candles, i, leftBars, rightBars) {
     if (candles[j].low <= pivotLow) return null;
   }
   for (let j = pivotIdx + 1; j <= i; j++) {
-    if (candles[j].low <= pivotLow) return null;
+    if (candles[j].low < pivotLow) return null;
   }
   return pivotLow;
 }

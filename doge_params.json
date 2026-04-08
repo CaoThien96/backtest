@@ -1,0 +1,22 @@
+{
+  "leftBars": 2,
+  "rightBars": 2,
+  "ppType": "Woodie",
+  "ppLevels": 1,
+  "atrPeriod": 14,
+  "slMultiplier": 5,
+  "tpMultiplier": 8.8,
+  "useSL": "Yes",
+  "useTP": "Yes",
+  "filterMode": "RVOL",
+  "rvolLookback": 5,
+  "rvolMin": 1.5,
+  "mfiLength": 14,
+  "mfiMin": 50,
+  "directionConfirmMode": "Body Bias",
+  "minBodyBias": 0.6,
+  "useZoneFilter": "Yes",
+  "zonePct": 1.7,
+  "tradeDir": "Both",
+  "minTick": 0
+}

@@ -102,8 +102,10 @@ function getPivotHigh(candles, i, leftBars, rightBars) {
   for (let j = pivotIdx - leftBars; j < pivotIdx; j++) {
     if (candles[j].high >= pivotHigh) return null;
   }
+  // Right: only a strictly higher high invalidates. Equal highs (e.g. double top at same price)
+  // still allow confirmation once rightBars have printed without exceeding the pivot.
   for (let j = pivotIdx + 1; j <= i; j++) {
-    if (candles[j].high >= pivotHigh) return null;
+    if (candles[j].high > pivotHigh) return null;
   }
   return pivotHigh;
 }
@@ -116,7 +118,7 @@ function getPivotLow(candles, i, leftBars, rightBars) {
     if (candles[j].low <= pivotLow) return null;
   }
   for (let j = pivotIdx + 1; j <= i; j++) {
-    if (candles[j].low <= pivotLow) return null;
+    if (candles[j].low < pivotLow) return null;
   }
   return pivotLow;
 }
