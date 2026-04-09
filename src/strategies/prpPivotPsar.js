@@ -29,16 +29,24 @@ function calcATR(candles, length) {
 // Aggregates 15m candles into UTC daily bars, computes PP levels from PREVIOUS
 // day's H/L/C (no lookahead). Returns per-candle array of level objects.
 function computeDailyPivotLevels(candles, ppType) {
-  const days = new Map(); // UTC dayKey → { high, low, close, firstIdx }
+  const days = new Map(); // UTC dayKey → { open, high, low, close, firstIdx }
+
   for (let i = 0; i < candles.length; i++) {
     const key = Math.floor(candles[i].timestamp / 86400000);
     if (!days.has(key)) {
-      days.set(key, { high: candles[i].high, low: candles[i].low, close: candles[i].close, firstIdx: i });
+      // Lưu giá OPEN của nến đầu tiên trong ngày
+      days.set(key, {
+        open: candles[i].open,
+        high: candles[i].high,
+        low: candles[i].low,
+        close: candles[i].close,
+        firstIdx: i
+      });
     } else {
       const d = days.get(key);
       d.high = Math.max(d.high, candles[i].high);
       d.low = Math.min(d.low, candles[i].low);
-      d.close = candles[i].close; // last candle of day
+      d.close = candles[i].close; // Cập nhật liên tục cho đến nến cuối ngày
     }
   }
 
@@ -46,11 +54,30 @@ function computeDailyPivotLevels(candles, ppType) {
   const result = new Array(candles.length).fill(null);
 
   for (let d = 1; d < dayKeys.length; d++) {
-    const { high: H, low: L, close: C } = days.get(dayKeys[d - 1]);
+    const prevDay = days.get(dayKeys[d - 1]);
+    const { open: O, high: H, low: L, close: C } = prevDay;
     const range = H - L;
     let levels;
 
     switch (ppType) {
+      case "DeMark": {
+        let x = 0;
+        if (C < O) x = H + 2 * L + C;
+        else if (C > O) x = 2 * H + L + C;
+        else x = H + L + 2 * C;
+
+        const pp = x / 4;
+        levels = {
+          pp: pp,
+          r1: x / 2 - L,
+          s1: x / 2 - H,
+          // DeMark thường chỉ có 1 cấp S/R, ta gán các cấp 2, 3 bằng null 
+          // để tránh lỗi logic ở các hàm isNearSupport/isNearResistance
+          r2: null, r3: null, s2: null, s3: null
+        };
+        break;
+      }
+
       case "Fibonacci": {
         const pp = (H + L + C) / 3;
         levels = {
@@ -86,9 +113,9 @@ function computeDailyPivotLevels(candles, ppType) {
       }
     }
 
-    const curr = days.get(dayKeys[d]);
+    const currDay = days.get(dayKeys[d]);
     const nextFirstIdx = d + 1 < dayKeys.length ? days.get(dayKeys[d + 1]).firstIdx : candles.length;
-    for (let i = curr.firstIdx; i < nextFirstIdx; i++) result[i] = levels;
+    for (let i = currDay.firstIdx; i < nextFirstIdx; i++) result[i] = levels;
   }
 
   return result;
@@ -254,7 +281,7 @@ export const PrpPivotPsarStrategy = {
   paramSchema: {
     leftBars: { type: "number", label: "Left Bars", default: 2, min: 1, max: 50 },
     rightBars: { type: "number", label: "Right Bars", default: 3, min: 1, max: 50 },
-    ppType: { type: "select", label: "PP Type", default: "Woodie", options: ["Standard", "Fibonacci", "Woodie", "Camarilla"] },
+    ppType: { type: "select", label: "PP Type", default: "Woodie", options: ["Standard", "Fibonacci", "Woodie", "Camarilla", "DeMark"] },
     ppLevels: { type: "number", label: "PP Levels", default: 1, min: 1, max: 3 },
     atrPeriod: { type: "number", label: "ATR Period", default: 14, min: 1, max: 100 },
     slMultiplier: { type: "number", label: "SL ATR Mult", default: 8.8, min: 0.1, max: 20, step: 0.1 },
@@ -601,7 +628,7 @@ export const PrpPivotPsarStrategy = {
     }
     return {
       pivotHigh: hprice > 0 ? hprice : null,
-      pivotLow:  lprice > 0 ? lprice : null,
+      pivotLow: lprice > 0 ? lprice : null,
       pivotHighTime: typeof pivotHighTime === "number" ? pivotHighTime : null,
       pivotLowTime: typeof pivotLowTime === "number" ? pivotLowTime : null,
     };

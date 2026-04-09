@@ -8,18 +8,18 @@ import { PrpPivotPsarStrategy } from "./src/strategies/prpPivotPsar.js";
 
 function parseArgs(argv) {
   const out = {
-    trades: "./trades.json",
-    params: "./prp_params.json",
+    trades: "./trades_sol.json",
+    params: "./sol_params.json",
     provider: "bybit",
-    symbol: "BTCUSDT",
+    symbol: "SOLUSDT",
     tfMinutes: 30,
     stopMode: "exact", // exact | proxy
     delayMsPerTrade: 1000,
     verbose: false,
     maxTrades: null,
     startTrade: null,
-    xPct: 0.2,
-    maxWaitCandles: 5, // 0 => wait until next opposite trade signal
+    xPct: 0.1,
+    maxWaitCandles: 0, // 0 => wait until next opposite trade signal
   };
 
   const args = argv.slice(2);

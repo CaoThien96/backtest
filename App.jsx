@@ -604,6 +604,7 @@ function StrategyControls({
 function CandlestickChart({
   candles,
   trades,
+  selectedTradeNumber,
   liveCandle,
   fetchMore,
   hasMoreRef,
@@ -647,12 +648,13 @@ function CandlestickChart({
   const slLineRef = useRef(null);
   const tpLineRef = useRef(null);
   const isFirstDataRef = useRef(true);
-  const [entryMarkerPositions, setEntryMarkerPositions] = useState([]); // { x, y, type } for overlay triangles
+  const [entryMarkerPositions, setEntryMarkerPositions] = useState([]); // { x, y, type, selected, tradeNumber, time }
   const [overlayKey, setOverlayKey] = useState(0);
   const [overlaySize, setOverlaySize] = useState({ w: 0, h: 0 });
 
   const candlesRef = useRef(candles);
   const lastChartTimeRef = useRef(null); // last time in chart (set when we setData); update() only allowed if live >= this
+  const lastAutoFocusedTradeRef = useRef(null);
   const fetchMoreRef = useRef(fetchMore);
   const liveCandleRef = useRef(liveCandle);
   const onCandleClickRef = useRef(onCandleClick);
@@ -834,13 +836,16 @@ function CandlestickChart({
     const cs = candleSeriesRef.current;
     if (!cs) return;
 
-    const markers = trades.map((trade) => ({
-      time: Math.floor(trade.entryTimestamp / 1000),
-      position: trade.type === "Long" ? "belowBar" : "aboveBar",
-      color: trade.type === "Long" ? THEME.blue : THEME.red,
-      shape: trade.type === "Long" ? "arrowUp" : "arrowDown",
-      text: trade.entrySignal,
-    }));
+    const markers = trades.map((trade) => {
+      const selected = selectedTradeNumber != null && trade.tradeNumber === selectedTradeNumber;
+      return {
+        time: Math.floor(trade.entryTimestamp / 1000),
+        position: trade.type === "Long" ? "belowBar" : "aboveBar",
+        color: selected ? "#FFD166" : (trade.type === "Long" ? THEME.blue : THEME.red),
+        shape: selected ? "circle" : (trade.type === "Long" ? "arrowUp" : "arrowDown"),
+        text: selected ? `${trade.entrySignal} #${trade.tradeNumber}` : trade.entrySignal,
+      };
+    });
 
     if (typeof pivotHighTime === "number" && Number.isFinite(pivotHighTime)) {
       markers.push({
@@ -863,7 +868,7 @@ function CandlestickChart({
 
     markers.sort((a, b) => a.time - b.time);
     cs.setMarkers(markers);
-  }, [trades, pivotHighTime, pivotLowTime]);
+  }, [trades, pivotHighTime, pivotLowTime, selectedTradeNumber]);
 
   // ── Pending buy/sell price lines ─────────────────────────────────────────────
   useEffect(() => {
@@ -1024,7 +1029,10 @@ function CandlestickChart({
         const t = Math.floor(trade.entryTimestamp / 1000);
         const x = ts.timeToCoordinate(t);
         const y = cs.priceToCoordinate(trade.entryPrice);
-        if (x != null && y != null) positions.push({ x, y, type: trade.type });
+        if (x != null && y != null) {
+          const selected = selectedTradeNumber != null && trade.tradeNumber === selectedTradeNumber;
+          positions.push({ x, y, type: trade.type, selected, tradeNumber: trade.tradeNumber, time: t });
+        }
       }
       setEntryMarkerPositions(positions);
     };
@@ -1034,7 +1042,51 @@ function CandlestickChart({
       requestAnimationFrame(compute);
     });
     return () => cancelAnimationFrame(id);
-  }, [trades, overlayKey, candles.length]);
+  }, [trades, overlayKey, candles.length, selectedTradeNumber]);
+
+  useEffect(() => {
+    if (selectedTradeNumber == null) {
+      lastAutoFocusedTradeRef.current = null;
+      return;
+    }
+    if (lastAutoFocusedTradeRef.current === selectedTradeNumber) return;
+    const chart = chartRef.current;
+    if (!chart) return;
+    const selectedTrade = trades.find((t) => t.tradeNumber === selectedTradeNumber);
+    if (!selectedTrade || typeof selectedTrade.entryTimestamp !== "number") return;
+    const entrySec = Math.floor(selectedTrade.entryTimestamp / 1000);
+    const ts = chart.timeScale();
+    const vr = ts.getVisibleRange();
+    if (vr && typeof vr.from === "number" && typeof vr.to === "number") {
+      const inRange = entrySec >= vr.from && entrySec <= vr.to;
+      if (inRange) return;
+    }
+    const span =
+      vr && typeof vr.from === "number" && typeof vr.to === "number" && Number.isFinite(vr.from) && Number.isFinite(vr.to)
+        ? Math.max(vr.to - vr.from, 1)
+        : 24 * 60 * 60;
+    const allTimes = candlesRef.current?.map((c) => c?.time).filter((v) => typeof v === "number" && Number.isFinite(v)) ?? [];
+    const minTime = allTimes.length ? Math.min(...allTimes) : null;
+    const maxTime = allTimes.length ? Math.max(...allTimes) : null;
+    let from = entrySec - span / 2;
+    let to = entrySec + span / 2;
+    if (minTime != null && maxTime != null) {
+      if (from < minTime) {
+        from = minTime;
+        to = from + span;
+      }
+      if (to > maxTime) {
+        to = maxTime;
+        from = to - span;
+      }
+      if (from < minTime) from = minTime;
+    }
+    ts.setVisibleRange({
+      from,
+      to,
+    });
+    lastAutoFocusedTradeRef.current = selectedTradeNumber;
+  }, [selectedTradeNumber, trades]);
 
   // Recompute overlay positions when chart container resizes; track size for SVG viewBox
   useEffect(() => {
@@ -1133,17 +1185,39 @@ function CandlestickChart({
         <div ref={containerRef} style={{ position: "absolute", inset: 0 }} />
         <div style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 10 }}>
           <svg width="100%" height="100%" viewBox={overlaySize.w && overlaySize.h ? `0 0 ${overlaySize.w} ${overlaySize.h}` : undefined} preserveAspectRatio="none" style={{ display: "block", overflow: "visible" }}>
+            {entryMarkerPositions
+              .filter((pos) => pos.selected)
+              .map((pos) => (
+                <line
+                  key={`selected-vline-${pos.tradeNumber ?? pos.time}`}
+                  x1={pos.x}
+                  x2={pos.x}
+                  y1={0}
+                  y2={overlaySize.h || 0}
+                  stroke={THEME.blue}
+                  strokeWidth={2}
+                  strokeOpacity={0.25}
+                />
+              ))}
             {entryMarkerPositions.map((pos, i) => {
-              const w = 10;
-              const h = 4;
-              const color = pos.type === "Long" ? THEME.blue : THEME.red;
+              const w = pos.selected ? 14 : 10;
+              const h = pos.selected ? 6 : 4;
+              const color = pos.selected ? "#FFD166" : (pos.type === "Long" ? THEME.blue : THEME.red);
               // Long: tam giác bên trái nến, đỉnh phải chỉ vào thân (tip at x,y)
               // Short: tam giác bên phải nến, đỉnh trái chỉ vào thân (tip at x,y)
               const points =
                 pos.type === "Long"
                   ? `${pos.x - w},${pos.y - h} ${pos.x - w},${pos.y + h} ${pos.x},${pos.y}`
                   : `${pos.x + w},${pos.y - h} ${pos.x + w},${pos.y + h} ${pos.x},${pos.y}`;
-              return <polygon key={i} points={points} fill={color} />;
+              return (
+                <polygon
+                  key={i}
+                  points={points}
+                  fill={color}
+                  stroke={pos.selected ? "#FFFFFF" : "none"}
+                  strokeWidth={pos.selected ? 1 : 0}
+                />
+              );
             })}
           </svg>
         </div>
@@ -1174,7 +1248,7 @@ function CandlestickChart({
 }
 
 // ─── Component: TradeTable ────────────────────────────────────────────────────
-function TradeTable({ trades, onTradeSelect, selectedTradeNumber }) {
+function TradeTable({ trades, onTradeSelect, onTradeShowOnChart, selectedTradeNumber }) {
   if (trades.length === 0) {
     return (
       <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: THEME.textSecondary, fontSize: 13 }}>
@@ -1227,7 +1301,14 @@ function TradeTable({ trades, onTradeSelect, selectedTradeNumber }) {
                   onClick={() => onTradeSelect?.(trade)}
                   style={{ background: selected ? `${THEME.blue}22` : rowBgAlt, borderTop: `1px solid ${THEME.border}`, cursor: "pointer" }}
                 >
-                  <td style={{ ...colStyle, verticalAlign: "middle" }} rowSpan={2}>
+                  <td
+                    style={{ ...colStyle, verticalAlign: "middle" }}
+                    rowSpan={2}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onTradeShowOnChart?.(trade);
+                    }}
+                  >
                     <div style={{ fontWeight: 600, color: THEME.textPrimary, fontSize: 12 }}>#{trade.tradeNumber}</div>
                     <div style={{ color: badgeColor, fontSize: 10, fontWeight: 600 }}>{trade.type.toUpperCase()}</div>
                   </td>
@@ -1709,7 +1790,7 @@ function maxConsecutiveStreaks(closedTrades) {
 }
 
 // ─── Component: StrategyReport ────────────────────────────────────────────────
-function StrategyReport({ trades, strategyName, onTradeSelect, selectedTradeNumber, detailPanel }) {
+function StrategyReport({ trades, strategyName, onTradeSelect, onTradeShowOnChart, selectedTradeNumber, detailPanel }) {
   const [activeTab, setActiveTab] = useState("trades");
   const [maeThresholdPct, setMaeThresholdPct] = useState(0.1);
 
@@ -1807,7 +1888,12 @@ function StrategyReport({ trades, strategyName, onTradeSelect, selectedTradeNumb
         {activeTab === "trades" && (
           <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
             <div style={{ flex: 1, minHeight: 0 }}>
-              <TradeTable trades={trades} onTradeSelect={onTradeSelect} selectedTradeNumber={selectedTradeNumber} />
+              <TradeTable
+                trades={trades}
+                onTradeSelect={onTradeSelect}
+                onTradeShowOnChart={onTradeShowOnChart}
+                selectedTradeNumber={selectedTradeNumber}
+              />
             </div>
             {detailPanel}
           </div>
@@ -1940,6 +2026,7 @@ export default function App() {
   const [feePct, setFeePct]             = useState(0.05); // % per side (open and close)
   const [prpEntryPriceMode, setPrpEntryPriceMode] = useState("Legacy");
   const [selectedTradeForDetail, setSelectedTradeForDetail] = useState(null);
+  const [selectedTradeForChart, setSelectedTradeForChart] = useState(null);
   const [selectedReplayCandle, setSelectedReplayCandle] = useState(null);
   const [minuteDetailVisible, setMinuteDetailVisible] = useState(true);
   const [minuteDetailRows, setMinuteDetailRows] = useState([]);
@@ -2295,6 +2382,10 @@ export default function App() {
     setMinuteDetailVisible(true);
   }, []);
 
+  const handleTradeShowOnChart = useCallback((trade) => {
+    setSelectedTradeForChart(trade);
+  }, []);
+
   const handleReplayCandleSelect = useCallback((candle) => {
     setSelectedTradeForDetail(null);
     setSelectedReplayCandle(candle);
@@ -2401,6 +2492,7 @@ export default function App() {
         <CandlestickChart
           candles={candles}
           trades={trades}
+          selectedTradeNumber={selectedTradeForChart?.tradeNumber ?? null}
           liveCandle={liveCandle}
           fetchMore={fetchMore}
           hasMoreRef={hasMoreRef}
@@ -2432,7 +2524,8 @@ export default function App() {
           trades={displayTrades}
           strategyName={strategy.name}
           onTradeSelect={handleTradeSelect}
-          selectedTradeNumber={selectedTradeForDetail?.tradeNumber ?? null}
+          onTradeShowOnChart={handleTradeShowOnChart}
+          selectedTradeNumber={selectedTradeForChart?.tradeNumber ?? null}
           detailPanel={
             minuteDetailVisible ? (
               <MinuteSimulationTable
