@@ -9,10 +9,10 @@ import { PrpPivotPsarStrategy } from "./src/strategies/prpPivotPsar.js";
 
 function parseArgs(argv) {
   const out = {
-    trades: "./trades_sol.json",
-    params: "./sol_params.json",
+    trades: "./trades_eth_2y.json",
+    params: "./eth_params.json",
     provider: "bybit",
-    symbol: "SOLUSDT",
+    symbol: "ETHUSDT",
     tfMinutes: 30,
     breakout: "close",
     stopMode: "exact", // exact | proxy

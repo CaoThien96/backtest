@@ -171,7 +171,7 @@ function isNearResistance(price, levels, ppLevels, zonePct) {
 
 // ── Relative Volume (RVOL) Helper ──────────────────────────────────────────────
 // RVOL[i] = volume[i] / average(volume[i-lookback..i-1])
-function computeRvol(candles, lookback) {
+export function computeRvol(candles, lookback) {
   const n = candles.length;
   const out = new Array(n).fill(null);
   if (!lookback || lookback <= 0) return out;
@@ -256,7 +256,7 @@ function computeExitLevels(type, entryPrice, atr, slMultiplier, tpMultiplier, us
   };
 }
 
-function passesDirectionConfirm(type, bar, mode, minBodyBias) {
+export function passesDirectionConfirm(type, bar, mode, minBodyBias) {
   if (!bar || mode === "None") return true;
   if (mode === "Candle Color") {
     return type === "long" ? bar.close >= bar.open : bar.close <= bar.open;
@@ -271,6 +271,17 @@ function passesDirectionConfirm(type, bar, mode, minBodyBias) {
     return bearishBody / range >= minBodyBias;
   }
   return true;
+}
+
+/**
+ * Backtest entry price when the pivot stop triggers on `bar`.
+ * @param {'StopFill'|'BarClose'} mode
+ * @param {'long'|'short'} type
+ */
+export function resolvePrpStopEntryPrice(mode, type, bar, stopPrice) {
+  if (mode === "BarClose") return bar.close;
+  if (type === "long") return bar.open > stopPrice ? bar.open : stopPrice;
+  return bar.open < stopPrice ? bar.open : stopPrice;
 }
 
 // ── Strategy Object ───────────────────────────────────────────────────────────
@@ -299,6 +310,12 @@ export const PrpPivotPsarStrategy = {
     zonePct: { type: "number", label: "Zone Width %", default: 2.6, min: 0.1, max: 5, step: 0.1 },
     tradeDir: { type: "select", label: "Direction", default: "Both", options: ["Long", "Short", "Both"] },
     minTick: { type: "number", label: "Min Tick", default: 1, min: 0, max: 500, step: 0.1 },
+    entryPriceMode: {
+      type: "select",
+      label: "Entry price",
+      default: "StopFill",
+      options: ["StopFill", "BarClose"],
+    },
   },
 
   generateSignals(candles, {
@@ -311,8 +328,10 @@ export const PrpPivotPsarStrategy = {
     useZoneFilter, zonePct,
     tradeDir,
     minTick,
+    entryPriceMode,
   }) {
     const TICK = minTick ?? BTCUSDT_MINTICK;
+    const entryMode = entryPriceMode === "BarClose" ? "BarClose" : "StopFill";
     // Precompute indicator arrays
     const atrArr = calcATR(candles, atrPeriod);
     const pivotLevels = computeDailyPivotLevels(candles, ppType);
@@ -421,7 +440,7 @@ export const PrpPivotPsarStrategy = {
       if (i > 0) {
         if (longArmed && hprice > 0 && bar.high >= hprice + TICK) {
           const stopPrice = hprice + TICK;
-          const entryPrice = bar.open > stopPrice ? bar.open : stopPrice;
+          const entryPrice = resolvePrpStopEntryPrice(entryMode, "long", bar, stopPrice);
           if (canLong && passesFilter("long", i)) {
             signals.push({
               barIndex: i,
@@ -438,7 +457,7 @@ export const PrpPivotPsarStrategy = {
         }
         if (shortArmed && lprice > 0 && bar.low <= lprice - TICK) {
           const stopPrice = lprice - TICK;
-          const entryPrice = bar.open < stopPrice ? bar.open : stopPrice;
+          const entryPrice = resolvePrpStopEntryPrice(entryMode, "short", bar, stopPrice);
           if (canShort && passesFilter("short", i)) {
             signals.push({
               barIndex: i,

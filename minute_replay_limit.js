@@ -358,7 +358,8 @@ async function main() {
   console.log(`Loading TF candles (interval=${opt.tfMinutes}m) from ${toIso(tfStartMs)} to ${toIso(tfEndMs)} ...`);
   const tfCandles = await fetchBybitRangeChunked({ symbol: opt.symbol, interval: String(opt.tfMinutes), startMs: tfStartMs, endMs: tfEndMs });
   console.log(`TF candles loaded: ${tfCandles.length}`);
-
+  // Save tfCandles to tfCandles.json
+  await fs.writeFile("tfCandles.json", JSON.stringify(tfCandles, null, 2), "utf8");
   const signalMap = new Map();
   if (opt.stopMode === "exact") {
     console.log("Rebuilding signals to recover stopLevel (stopMode=exact) ...");

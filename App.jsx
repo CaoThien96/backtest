@@ -139,11 +139,6 @@ function isPrpPivotFamily(id) {
   return typeof id === "string" && id.startsWith("prp-pivot-psar");
 }
 
-/** Strategies that support async 1m RVOL repricing for entry price (Legacy vs Actual). */
-function needsPrpRvolReprice(id) {
-  return id === "prp-pivot-psar" || id === "prp-pivot-psar-v4";
-}
-
 function sortAndClipCandlesInRange(candles, startMs, endMs) {
   const sorted = [...candles]
     .filter((c) => c?.timestamp >= startMs && c?.timestamp < endMs)
@@ -506,8 +501,6 @@ function StrategyControls({
   onPositionSizeChange,
   feePct,
   onFeePctChange,
-  prpEntryPriceMode,
-  onPrpEntryPriceModeChange,
 }) {
   const strategy = STRATEGY_MAP[selectedId];
 
@@ -553,22 +546,6 @@ function StrategyControls({
 
       {/* Divider */}
       <div style={{ width: 1, height: 14, background: THEME.border }} />
-
-      {(selectedId === "prp-pivot-psar" || selectedId === "prp-pivot-psar-v4") && (
-        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: THEME.textSecondary }}>
-          Entry Price Mode
-          <select
-            value={prpEntryPriceMode}
-            onChange={(e) => onPrpEntryPriceModeChange(e.target.value)}
-            style={{ background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 12, cursor: "pointer" }}
-          >
-            <option value="Legacy">Legacy (Old)</option>
-            <option value="Actual">Actual (1m RVOL)</option>
-          </select>
-        </label>
-      )}
-
-      {(selectedId === "prp-pivot-psar" || selectedId === "prp-pivot-psar-v4") && <div style={{ width: 1, height: 14, background: THEME.border }} />}
 
       {/* Auto-generated param inputs */}
       {Object.entries(strategy.paramSchema).map(([key, schema]) => (
@@ -1138,6 +1115,12 @@ function CandlestickChart({
     typeof currentRvol === "number" && Number.isFinite(currentRvol)
       ? ` · RVOL ${currentRvol.toFixed(2)}`
       : "";
+  const liveBodyBiasLong = liveCandle ? getBodyBias("long", liveCandle) : null;
+  const liveBodyBiasShort = liveCandle ? getBodyBias("short", liveCandle) : null;
+  const bodyBiasText =
+    Number.isFinite(liveBodyBiasLong) && Number.isFinite(liveBodyBiasShort)
+      ? ` · BB L ${liveBodyBiasLong.toFixed(3)} / S ${liveBodyBiasShort.toFixed(3)}`
+      : "";
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", background: THEME.bgPrimary }}>
@@ -1161,7 +1144,7 @@ function CandlestickChart({
             <option key={asset} value={asset}>{asset}</option>
           ))}
         </select>
-        <span style={{ color: THEME.textPrimary, fontWeight: 700, fontSize: 13 }}>{symbolLabel} · {INTERVALS.find((i) => i.value === selectedInterval)?.label ?? selectedInterval}{rvolText}</span>
+        <span style={{ color: THEME.textPrimary, fontWeight: 700, fontSize: 13 }}>{symbolLabel} · {INTERVALS.find((i) => i.value === selectedInterval)?.label ?? selectedInterval}{rvolText}{bodyBiasText}</span>
         {displayBar && (
           <div style={{ display: "flex", gap: 10, fontSize: 12, fontFamily: "'Source Code Pro', monospace" }}>
             {[["O", displayBar.open], ["H", displayBar.high], ["L", displayBar.low], ["C", displayBar.close]].map(([label, val]) => (
@@ -1685,7 +1668,7 @@ function ExcursionsChart({ trades }) {
 }
 
 // ─── Component: MetricsTab ────────────────────────────────────────────────────
-function MetricsTab({ trades }) {
+function MetricsTab({ trades, signalDirectionStats }) {
   const closed = trades.filter((t) => !t.isOpen);
 
   if (closed.length === 0) {
@@ -1726,7 +1709,7 @@ function MetricsTab({ trades }) {
   return (
     <div style={{ height: "100%", overflowY: "auto", padding: "12px 14px" }}>
       {/* ── Summary stats ───────────────────────────────────────────────────── */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10 }}>
         <StatCard
           label="Total P&L"
           value={`${totalPnL >= 0 ? "+" : ""}${formatPrice(totalPnL)}`}
@@ -1749,6 +1732,12 @@ function MetricsTab({ trades }) {
           value={isFinite(profitFactor) ? profitFactor.toFixed(2) : "∞"}
           sub={`Max drawdown: ${formatPrice(maxDD)}`}
           color={profitFactor >= 1 ? THEME.green : THEME.red}
+        />
+        <StatCard
+          label="Signal Color Aligned"
+          value={`${signalDirectionStats.alignedTotal}/${signalDirectionStats.total}`}
+          sub={`LONG ${signalDirectionStats.longAligned}/${signalDirectionStats.longTotal} · SHORT ${signalDirectionStats.shortAligned}/${signalDirectionStats.shortTotal}`}
+          color={signalDirectionStats.alignedPct >= 50 ? THEME.green : THEME.red}
         />
       </div>
 
@@ -1790,7 +1779,7 @@ function maxConsecutiveStreaks(closedTrades) {
 }
 
 // ─── Component: StrategyReport ────────────────────────────────────────────────
-function StrategyReport({ trades, strategyName, onTradeSelect, onTradeShowOnChart, selectedTradeNumber, detailPanel }) {
+function StrategyReport({ trades, strategyName, signalDirectionStats, onTradeSelect, onTradeShowOnChart, selectedTradeNumber, detailPanel }) {
   const [activeTab, setActiveTab] = useState("trades");
   const [maeThresholdPct, setMaeThresholdPct] = useState(0.1);
 
@@ -1826,6 +1815,9 @@ function StrategyReport({ trades, strategyName, onTradeSelect, onTradeShowOnChar
           {totalDays !== null && <span>{totalDays} days</span>}
           <span>{closedTrades} trades</span>
           <span>Win rate: {closedTrades ? Math.round((winTrades / closedTrades) * 100) : 0}%</span>
+          <span>
+            Signal color aligned: {signalDirectionStats.alignedTotal}/{signalDirectionStats.total} ({signalDirectionStats.alignedPct.toFixed(1)}%)
+          </span>
           <span style={{ color: totalPnL >= 0 ? THEME.green : THEME.red, fontWeight: 600 }}>
             Total P&L: {totalPnL >= 0 ? "+" : ""}{formatPrice(totalPnL)} USDT
           </span>
@@ -1898,7 +1890,7 @@ function StrategyReport({ trades, strategyName, onTradeSelect, onTradeShowOnChar
             {detailPanel}
           </div>
         )}
-        {activeTab === "metrics" && <MetricsTab trades={trades} />}
+        {activeTab === "metrics" && <MetricsTab trades={trades} signalDirectionStats={signalDirectionStats} />}
       </div>
     </div>
   );
@@ -2024,7 +2016,6 @@ export default function App() {
   });
   const [positionSize, setPositionSize] = useState(2000);
   const [feePct, setFeePct]             = useState(0.05); // % per side (open and close)
-  const [prpEntryPriceMode, setPrpEntryPriceMode] = useState("Legacy");
   const [selectedTradeForDetail, setSelectedTradeForDetail] = useState(null);
   const [selectedTradeForChart, setSelectedTradeForChart] = useState(null);
   const [selectedReplayCandle, setSelectedReplayCandle] = useState(null);
@@ -2037,7 +2028,6 @@ export default function App() {
   const minuteDetailCacheRef = useRef(new Map());
   const minuteRangeCacheRef = useRef(new Map());
   const minuteDetailReqRef = useRef(0);
-  const [repricedPrpSignals, setRepricedPrpSignals] = useState(null);
   const [prpV5MinuteCandles, setPrpV5MinuteCandles] = useState([]);
   const [prpV5MinuteStatus, setPrpV5MinuteStatus] = useState("idle");
   const skipPersistRef = useRef(false);
@@ -2101,90 +2091,6 @@ export default function App() {
     [candles, liveCandleForBacktest]
   );
 
-  useEffect(() => {
-    const strategy = STRATEGY_MAP[selectedStrategyId];
-    if (!strategy || !needsPrpRvolReprice(selectedStrategyId) || !allCandlesForBacktest.length) {
-      setRepricedPrpSignals(null);
-      return;
-    }
-    if (prpEntryPriceMode !== "Actual") {
-      setRepricedPrpSignals(null);
-      return;
-    }
-    if (strategyParams.filterMode !== "RVOL") {
-      setRepricedPrpSignals(null);
-      return;
-    }
-
-    const reqId = Date.now();
-    let cancelled = false;
-    const tfMs = intervalToMinutes(selectedInterval) * 60 * 1000;
-    const lookback = Number(strategyParams.rvolLookback ?? 0);
-    const minRvol = Number(strategyParams.rvolMin ?? 0);
-    const baseSignals = strategy.generateSignals(allCandlesForBacktest, strategyParams);
-
-    (async () => {
-      const nextSignals = [...baseSignals];
-      for (let idx = 0; idx < nextSignals.length; idx++) {
-        const s = nextSignals[idx];
-        const bar = allCandlesForBacktest[s.barIndex];
-        if (!bar) continue;
-        const startMs = bar.timestamp;
-        const endMs = startMs + tfMs;
-        const { candles: minuteCandles } = await loadMinuteRangeCached({
-          providerId: selectedProviderId,
-          symbol: selectedSymbol,
-          startMs,
-          endMs,
-          inMemoryRef: minuteRangeCacheRef,
-        });
-        if (cancelled || reqId == null) return;
-        if (!minuteCandles.length) continue;
-        const tfCandles = allCandlesForBacktest.filter((c) => c.timestamp < startMs).sort((a, b) => a.time - b.time);
-        const rvolArr = calcDynamicRvolForMinuteRows(minuteCandles, tfCandles, startMs, lookback);
-        const tick = Number(strategyParams.minTick ?? 0.1);
-        const triggerLevel = s.type === "long"
-          ? (s.stopLevel ?? 0) + tick
-          : (s.stopLevel ?? 0) - tick;
-        let repriced = null;
-        for (let i = 0; i < minuteCandles.length; i++) {
-          const m = minuteCandles[i];
-          const rvol = rvolArr[i];
-          if (rvol == null || rvol < minRvol) continue;
-          if (s.type === "long") {
-            if (m.close >= triggerLevel) {
-              repriced = m.close;
-              break;
-            }
-          } else if (s.type === "short") {
-            if (m.close <= triggerLevel) {
-              repriced = m.close;
-              break;
-            }
-          }
-        }
-        if (repriced != null && Number.isFinite(repriced)) {
-          nextSignals[idx] = { ...s, entryPrice: repriced };
-        }
-      }
-      if (!cancelled) setRepricedPrpSignals(nextSignals);
-    })().catch(() => {
-      if (!cancelled) setRepricedPrpSignals(null);
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    selectedStrategyId,
-    strategyParams,
-    allCandlesForBacktest,
-    selectedInterval,
-    selectedProviderId,
-    selectedSymbol,
-    prpEntryPriceMode,
-  ]);
-
   // Preload 1m candles for PRP v5 intrabar backtest
   useEffect(() => {
     if (selectedStrategyId !== "prp-pivot-psar-v5") {
@@ -2232,8 +2138,7 @@ export default function App() {
     };
   }, [selectedStrategyId, allCandlesForBacktest, selectedInterval, selectedProviderId, selectedSymbol]);
 
-  // Chạy backtest mỗi khi confirmed candles hoặc throttled live candle thay đổi
-  const trades = useMemo(() => {
+  const signals = useMemo(() => {
     const allCandles = allCandlesForBacktest;
     if (allCandles.length === 0) return [];
     const strategy = STRATEGY_MAP[selectedStrategyId];
@@ -2242,28 +2147,54 @@ export default function App() {
         return [];
       }
       const tfMinutes = intervalToMinutes(selectedInterval);
-      const sigs = strategy.generateSignals(allCandles, strategyParams, {
+      return strategy.generateSignals(allCandles, strategyParams, {
         minuteCandles: prpV5MinuteCandles,
         tfMinutes,
       });
-      return runBacktest(allCandles, sigs, { positionSizeUSDT: positionSize, feePct: feePct / 100 });
     }
-    const useRepriced = needsPrpRvolReprice(selectedStrategyId) && repricedPrpSignals?.length;
-    const sigs = useRepriced
-      ? repricedPrpSignals
-      : strategy.generateSignals(allCandles, strategyParams);
-    return runBacktest(allCandles, sigs, { positionSizeUSDT: positionSize, feePct: feePct / 100 });
+    return strategy.generateSignals(allCandles, strategyParams);
   }, [
     allCandlesForBacktest,
     selectedStrategyId,
     strategyParams,
-    positionSize,
-    feePct,
-    repricedPrpSignals,
     prpV5MinuteCandles,
     prpV5MinuteStatus,
     selectedInterval,
   ]);
+
+  // Chạy backtest mỗi khi confirmed candles hoặc throttled live candle thay đổi
+  const trades = useMemo(() => {
+    const allCandles = allCandlesForBacktest;
+    if (allCandles.length === 0) return [];
+    return runBacktest(allCandles, signals, { positionSizeUSDT: positionSize, feePct: feePct / 100 });
+  }, [allCandlesForBacktest, signals, positionSize, feePct]);
+
+  const signalDirectionStats = useMemo(() => {
+    const stats = {
+      longTotal: 0,
+      longAligned: 0,
+      shortTotal: 0,
+      shortAligned: 0,
+      total: 0,
+      alignedTotal: 0,
+      alignedPct: 0,
+    };
+    for (const sig of signals) {
+      const bar = allCandlesForBacktest[sig.barIndex];
+      if (!bar) continue;
+      if (sig.type === "long") {
+        stats.longTotal += 1;
+        if (bar.close >= bar.open) stats.longAligned += 1;
+      } else if (sig.type === "short") {
+        stats.shortTotal += 1;
+        if (bar.close <= bar.open) stats.shortAligned += 1;
+      }
+    }
+    stats.total = stats.longTotal + stats.shortTotal;
+    stats.alignedTotal = stats.longAligned + stats.shortAligned;
+    stats.alignedPct = stats.total > 0 ? (stats.alignedTotal / stats.total) * 100 : 0;
+    return stats;
+  }, [signals, allCandlesForBacktest]);
 
   const displayTrades = useMemo(() => {
     return trades;
@@ -2483,8 +2414,6 @@ export default function App() {
         onPositionSizeChange={setPositionSize}
         feePct={feePct}
         onFeePctChange={setFeePct}
-        prpEntryPriceMode={prpEntryPriceMode}
-        onPrpEntryPriceModeChange={setPrpEntryPriceMode}
       />
 
       {/* Chart — 60% height */}
@@ -2523,6 +2452,7 @@ export default function App() {
         <StrategyReport
           trades={displayTrades}
           strategyName={strategy.name}
+          signalDirectionStats={signalDirectionStats}
           onTradeSelect={handleTradeSelect}
           onTradeShowOnChart={handleTradeShowOnChart}
           selectedTradeNumber={selectedTradeForChart?.tradeNumber ?? null}
