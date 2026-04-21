@@ -815,12 +815,13 @@ function CandlestickChart({
 
     const markers = trades.map((trade) => {
       const selected = selectedTradeNumber != null && trade.tradeNumber === selectedTradeNumber;
+      const baseLabel = `${trade.entrySignal}`;
       return {
         time: Math.floor(trade.entryTimestamp / 1000),
         position: trade.type === "Long" ? "belowBar" : "aboveBar",
         color: selected ? "#FFD166" : (trade.type === "Long" ? THEME.blue : THEME.red),
         shape: selected ? "circle" : (trade.type === "Long" ? "arrowUp" : "arrowDown"),
-        text: selected ? `${trade.entrySignal} #${trade.tradeNumber}` : trade.entrySignal,
+        text: selected ? `${baseLabel} #${trade.tradeNumber}` : baseLabel,
       };
     });
 
@@ -1111,6 +1112,78 @@ function CandlestickChart({
 
   const barUp = displayBar ? displayBar.close >= displayBar.open : true;
   const barColor = barUp ? THEME.green : THEME.red;
+  const openTrade = trades.length > 0 && trades[trades.length - 1]?.isOpen ? trades[trades.length - 1] : null;
+  const openTradeEntry = openTrade?.entryPrice;
+  const openTradePositionSize = openTrade?.positionSize;
+  const openTradePositionValue = openTrade?.positionValue;
+
+  const openTradeRisk =
+    openTrade &&
+    typeof openTradeEntry === "number" &&
+    Number.isFinite(openTradeEntry) &&
+    typeof activeStopLoss === "number" &&
+    Number.isFinite(activeStopLoss)
+      ? Math.abs(openTradeEntry - activeStopLoss)
+      : null;
+  const openTradeReward =
+    openTrade &&
+    typeof openTradeEntry === "number" &&
+    Number.isFinite(openTradeEntry) &&
+    typeof activeTakeProfit === "number" &&
+    Number.isFinite(activeTakeProfit)
+      ? Math.abs(activeTakeProfit - openTradeEntry)
+      : null;
+  const openTradeRR =
+    typeof openTradeRisk === "number" &&
+    Number.isFinite(openTradeRisk) &&
+    openTradeRisk > 0 &&
+    typeof openTradeReward === "number" &&
+    Number.isFinite(openTradeReward)
+      ? openTradeReward / openTradeRisk
+      : null;
+
+  const calcTargetPnL = useCallback((targetPrice) => {
+    if (!openTrade) return null;
+    if (typeof targetPrice !== "number" || !Number.isFinite(targetPrice)) return null;
+    if (typeof openTradeEntry !== "number" || !Number.isFinite(openTradeEntry)) return null;
+    if (typeof openTradePositionSize !== "number" || !Number.isFinite(openTradePositionSize)) return null;
+    if (typeof openTradePositionValue !== "number" || !Number.isFinite(openTradePositionValue) || openTradePositionValue === 0) return null;
+
+    const pnl =
+      openTrade.type === "Long"
+        ? (targetPrice - openTradeEntry) * openTradePositionSize
+        : (openTradeEntry - targetPrice) * openTradePositionSize;
+    const pnlPercent = (pnl / openTradePositionValue) * 100;
+    return { pnl, pnlPercent };
+  }, [openTrade, openTradeEntry, openTradePositionSize, openTradePositionValue]);
+
+  const tpPotentialPnL = calcTargetPnL(activeTakeProfit);
+  const slPotentialPnL = calcTargetPnL(activeStopLoss);
+  const formatPotentialPnL = (stat) => {
+    if (!stat) return "—";
+    return formatPnL(stat.pnl, stat.pnlPercent);
+  };
+
+  const candleRealizePct =
+    displayBar &&
+    typeof displayBar.open === "number" &&
+    Number.isFinite(displayBar.open) &&
+    displayBar.open !== 0 &&
+    typeof displayBar.close === "number" &&
+    Number.isFinite(displayBar.close)
+      ? ((displayBar.close - displayBar.open) / displayBar.open) * 100
+      : null;
+  const candleMaxChangePct =
+    displayBar &&
+    typeof displayBar.open === "number" &&
+    Number.isFinite(displayBar.open) &&
+    displayBar.open !== 0 &&
+    typeof displayBar.high === "number" &&
+    Number.isFinite(displayBar.high) &&
+    typeof displayBar.low === "number" &&
+    Number.isFinite(displayBar.low)
+      ? (Math.max(Math.abs(displayBar.high - displayBar.open), Math.abs(displayBar.low - displayBar.open)) / displayBar.open) * 100
+      : null;
   const rvolText =
     typeof currentRvol === "number" && Number.isFinite(currentRvol)
       ? ` · RVOL ${currentRvol.toFixed(2)}`
@@ -1154,6 +1227,27 @@ function CandlestickChart({
             ))}
             {displayBar.volume != null && (
               <span style={{ color: THEME.textSecondary }}>Vol <span style={{ color: THEME.textPrimary }}>{displayBar.volume?.toFixed(2)}</span></span>
+            )}
+            {typeof candleRealizePct === "number" && Number.isFinite(candleRealizePct) && typeof candleMaxChangePct === "number" && Number.isFinite(candleMaxChangePct) && (
+              <span style={{ color: THEME.textSecondary }}>
+                Chg <span style={{ color: candleRealizePct >= 0 ? THEME.green : THEME.red }}>{candleRealizePct >= 0 ? "+" : ""}{candleRealizePct.toFixed(2)}%</span>{" "}
+                <span style={{ color: THEME.textPrimary }}>({candleMaxChangePct.toFixed(2)}%)</span>
+              </span>
+            )}
+            {typeof openTradeRR === "number" && Number.isFinite(openTradeRR) && (
+              <span style={{ color: THEME.textSecondary }}>
+                R:R <span style={{ color: THEME.textPrimary }}>{openTradeRR.toFixed(2)}</span>
+              </span>
+            )}
+            {tpPotentialPnL && (
+              <span style={{ color: THEME.textSecondary }}>
+                TP <span style={{ color: tpPotentialPnL.pnl >= 0 ? THEME.green : THEME.red }}>{formatPotentialPnL(tpPotentialPnL)}</span>
+              </span>
+            )}
+            {slPotentialPnL && (
+              <span style={{ color: THEME.textSecondary }}>
+                SL <span style={{ color: slPotentialPnL.pnl >= 0 ? THEME.green : THEME.red }}>{formatPotentialPnL(slPotentialPnL)}</span>
+              </span>
             )}
           </div>
         )}
@@ -1249,20 +1343,19 @@ function TradeTable({ trades, onTradeSelect, onTradeShowOnChart, selectedTradeNu
     <div style={{ overflowY: "auto", height: "100%" }}>
       <table style={{ width: "100%", borderCollapse: "collapse", tableLayout: "fixed" }}>
         <colgroup>
-          <col style={{ width: "90px" }} />
-          <col style={{ width: "55px" }} />
-          <col style={{ width: "155px" }} />
-          <col style={{ width: "90px" }} />
-          <col style={{ width: "105px" }} />
-          <col style={{ width: "100px" }} />
-          <col style={{ width: "145px" }} />
+          <col style={{ width: "88px" }} />
+          <col style={{ width: "56px" }} />
+          <col style={{ width: "150px" }} />
+          <col style={{ width: "92px" }} />
+          <col style={{ width: "120px" }} />
           <col style={{ width: "130px" }} />
-          <col style={{ width: "130px" }} />
+          <col style={{ width: "120px" }} />
+          <col style={{ width: "120px" }} />
           <col style={{ width: "130px" }} />
         </colgroup>
         <thead>
           <tr>
-            {["Trade #", "Type", "Date & Time", "Signal", "Price", "Qty / Value", "Net P&L", "MFE", "MAE", "Cum. P&L"].map((h) => (
+            {["Trade #", "Type", "Date & Time", "Signal", "Price", "Net P&L", "MFE", "MAE", "Cum. P&L"].map((h) => (
               <th key={h} style={{ ...thStyle, textAlign: "left", borderBottom: `1px solid ${THEME.border}` }}>{h}</th>
             ))}
           </tr>
@@ -1302,29 +1395,25 @@ function TradeTable({ trades, onTradeSelect, onTradeShowOnChart, selectedTradeNu
                   <td style={{ ...colStyle, color: THEME.textSecondary }}>
                     {trade.isOpen ? <span style={{ color: THEME.textSecondary }}>Open</span> : (trade.exitSignal ?? "—")}
                   </td>
-                  <td style={{ ...colStyle, color: THEME.textPrimary, textAlign: "right" }}>
+                  <td style={{ ...colStyle, color: THEME.textPrimary, textAlign: "left" }}>
                     {trade.isOpen
                       ? <span style={{ color: THEME.textSecondary }}>—</span>
                       : <>{formatPrice(trade.exitPrice)} <span style={{ color: THEME.textSecondary, fontSize: 10 }}>USDT</span></>}
                   </td>
-                  {/* Span rows */}
-                  <td style={{ ...colStyle, textAlign: "center", color: THEME.textPrimary }} rowSpan={2}>
-                    {trade.positionSize} <span style={{ color: THEME.textSecondary, fontSize: 10 }}>/ {(trade.positionValue / 1000).toFixed(1)}K</span>
-                  </td>
-                  <td style={{ ...colStyle, textAlign: "right", color: pnlColor }} rowSpan={2}>
+                  <td style={{ ...colStyle, textAlign: "left", color: pnlColor }} rowSpan={2}>
                     {trade.isOpen ? <span style={{ color: THEME.textSecondary }}>unrealized</span> : null}
                     <div>{trade.netPnL >= 0 ? "+" : ""}{formatPrice(trade.netPnL)}</div>
                     <div style={{ fontSize: 10 }}>{trade.netPnL >= 0 ? "+" : ""}{trade.netPnLPercent?.toFixed(2)}%</div>
                   </td>
-                  <td style={{ ...colStyle, textAlign: "right", color: THEME.green }} rowSpan={2}>
+                  <td style={{ ...colStyle, textAlign: "left", color: THEME.green }} rowSpan={2}>
                     <div>+{formatPrice(trade.favorableExcursion)}</div>
                     <div style={{ fontSize: 10 }}>+{trade.favorableExcursionPercent?.toFixed(2)}%</div>
                   </td>
-                  <td style={{ ...colStyle, textAlign: "right", color: THEME.red }} rowSpan={2}>
+                  <td style={{ ...colStyle, textAlign: "left", color: THEME.red }} rowSpan={2}>
                     <div>{formatPrice(trade.adverseExcursion)}</div>
                     <div style={{ fontSize: 10 }}>{trade.adverseExcursionPercent?.toFixed(2)}%</div>
                   </td>
-                  <td style={{ ...colStyle, textAlign: "right", color: cumColor }} rowSpan={2}>
+                  <td style={{ ...colStyle, textAlign: "left", color: cumColor }} rowSpan={2}>
                     <div>{trade.cumulativePnL >= 0 ? "+" : ""}{formatPrice(trade.cumulativePnL)}</div>
                     <div style={{ fontSize: 10 }}>{trade.cumulativePnLPercent?.toFixed(2)}%</div>
                   </td>
@@ -1339,7 +1428,7 @@ function TradeTable({ trades, onTradeSelect, onTradeShowOnChart, selectedTradeNu
                   <td style={{ ...colStyle, color: THEME.textSecondary }}>Entry</td>
                   <td style={{ ...colStyle, color: THEME.textPrimary }}>{formatDateTime(trade.entryTimestamp)}</td>
                   <td style={{ ...colStyle, color: THEME.textSecondary }}>{trade.entrySignal}</td>
-                  <td style={{ ...colStyle, color: THEME.textPrimary, textAlign: "right" }}>
+                  <td style={{ ...colStyle, color: THEME.textPrimary, textAlign: "left" }}>
                     {formatPrice(trade.entryPrice)} <span style={{ color: THEME.textSecondary, fontSize: 10 }}>USDT</span>
                   </td>
                 </tr>
@@ -2085,7 +2174,7 @@ export default function App() {
   }, [selectedProviderId, selectedAsset, selectedStrategyId, strategyParams]);
 
   // liveCandle throttled 30s — tránh backtest recompute mỗi WS tick
-  const liveCandleForBacktest = useThrottle(liveCandle, 30000);
+  const liveCandleForBacktest = useThrottle(liveCandle, 1000);
   const allCandlesForBacktest = useMemo(
     () => (liveCandleForBacktest ? [...candles, liveCandleForBacktest] : candles),
     [candles, liveCandleForBacktest]

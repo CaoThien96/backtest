@@ -479,8 +479,12 @@ export const PrpPivotPsarStrategy = {
       const swl = getPivotLow(candles, i, leftBars, rightBars);
 
       // ── STEP 3: Update hprice / lprice ─────────────────────────────────────
-      if (swh !== null) hprice = swh;
-      if (swl !== null) lprice = swl;
+      if (swh !== null) {
+        hprice = swh;
+      }
+      if (swl !== null) {
+        lprice = swl;
+      }
 
       // ── STEP 4: Update arming state ─────────────────────────────────────────
       // Pine: longArmed := swl_cond and longZoneOk ? true : (longArmed and high > hprice ? false : longArmed)
