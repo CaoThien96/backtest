@@ -128,6 +128,67 @@ function formatPnL(val, percent) {
   return `${sign}${formatPrice(val)} (${sign}${percent?.toFixed(2)}%)`;
 }
 
+function formatIndicatorNumber(val) {
+  if (!Number.isFinite(val)) return "—";
+  return val.toLocaleString("en-US", {
+    minimumFractionDigits: 4,
+    maximumFractionDigits: 4,
+  });
+}
+
+function calcEMAFromCandles(candles, length) {
+  const out = new Array(candles.length).fill(null);
+  if (!Array.isArray(candles) || candles.length === 0 || !Number.isFinite(length) || length <= 0) return out;
+  const k = 2 / (length + 1);
+  let ema = candles[0].close;
+  out[0] = ema;
+  for (let i = 1; i < candles.length; i++) {
+    ema = candles[i].close * k + ema * (1 - k);
+    out[i] = ema;
+  }
+  return out;
+}
+
+function calcMACDFromCandles(candles, fastLen = 12, slowLen = 26, sigLen = 9) {
+  const n = candles.length;
+  const macdArr = new Array(n).fill(null);
+  const signalArr = new Array(n).fill(null);
+  const histArr = new Array(n).fill(null);
+  const histColorArr = new Array(n).fill(null);
+  if (!n) return { macdArr, signalArr, histArr, histColorArr };
+
+  const emaFast = calcEMAFromCandles(candles, fastLen);
+  const emaSlow = calcEMAFromCandles(candles, slowLen);
+  for (let i = 0; i < n; i++) {
+    const f = emaFast[i];
+    const s = emaSlow[i];
+    if (Number.isFinite(f) && Number.isFinite(s)) macdArr[i] = f - s;
+  }
+
+  const k = 2 / (sigLen + 1);
+  let sig = null;
+  for (let i = 0; i < n; i++) {
+    const m = macdArr[i];
+    if (!Number.isFinite(m)) continue;
+    sig = sig == null ? m : (m * k + sig * (1 - k));
+    signalArr[i] = sig;
+    histArr[i] = m - sig;
+  }
+
+  for (let i = 0; i < n; i++) {
+    const h = histArr[i];
+    if (!Number.isFinite(h)) continue;
+    const prev = i > 0 ? histArr[i - 1] : null;
+    if (h >= 0) {
+      histColorArr[i] = Number.isFinite(prev) && h > prev ? "#26a69a" : "#b2dfdb";
+    } else {
+      histColorArr[i] = Number.isFinite(prev) && h > prev ? "#ffcdd2" : "#ff5252";
+    }
+  }
+
+  return { macdArr, signalArr, histArr, histColorArr };
+}
+
 function intervalToMinutes(interval) {
   if (interval === "D") return 1440;
   const n = Number(interval);
@@ -617,6 +678,11 @@ function CandlestickChart({
   const chartRef = useRef(null);
   const candleSeriesRef = useRef(null);
   const volSeriesRef = useRef(null);
+  const ema50SeriesRef = useRef(null);
+  const ema200SeriesRef = useRef(null);
+  const macdHistSeriesRef = useRef(null);
+  const macdLineSeriesRef = useRef(null);
+  const macdSignalSeriesRef = useRef(null);
   const priceLineRef = useRef(null);
   const pendingBuyLineRef = useRef(null);
   const pendingSellLineRef = useRef(null);
@@ -626,6 +692,7 @@ function CandlestickChart({
   const tpLineRef = useRef(null);
   const isFirstDataRef = useRef(true);
   const [entryMarkerPositions, setEntryMarkerPositions] = useState([]); // { x, y, type, selected, tradeNumber, time }
+  const [emaCrossPositions, setEmaCrossPositions] = useState([]); // { x, y, color, time }
   const [overlayKey, setOverlayKey] = useState(0);
   const [overlaySize, setOverlaySize] = useState({ w: 0, h: 0 });
 
@@ -652,6 +719,66 @@ function CandlestickChart({
   const hoveredCandle = hoveredTime != null ? candleByTime.get(hoveredTime) ?? null : null;
   const displayBar = hoveredCandle ?? liveCandle ?? (candles.length > 0 ? candles[candles.length - 1] : null);
   const referenceClose = displayBar?.close ?? null;
+  const emaInputCandles = useMemo(() => {
+    if (!liveCandle || candles.length === 0) return candles;
+    const last = candles[candles.length - 1];
+    if (!last) return candles;
+    if (liveCandle.time < last.time) return candles;
+    if (liveCandle.time === last.time) return [...candles.slice(0, -1), liveCandle];
+    return [...candles, liveCandle];
+  }, [candles, liveCandle]);
+  const emaCrossData = useMemo(() => {
+    if (!emaInputCandles.length) {
+      return { ema50: null, ema200: null, crossPoints: [] };
+    }
+    const ema50Arr = calcEMAFromCandles(emaInputCandles, 50);
+    const ema200Arr = calcEMAFromCandles(emaInputCandles, 200);
+    const crossPoints = [];
+    for (let i = 1; i < emaInputCandles.length; i++) {
+      const prev50 = ema50Arr[i - 1];
+      const prev200 = ema200Arr[i - 1];
+      const curr50 = ema50Arr[i];
+      const curr200 = ema200Arr[i];
+      if (!Number.isFinite(prev50) || !Number.isFinite(prev200) || !Number.isFinite(curr50) || !Number.isFinite(curr200)) continue;
+      const golden = prev50 <= prev200 && curr50 > curr200;
+      const death = prev50 >= prev200 && curr50 < curr200;
+      if (!golden && !death) continue;
+      const bar = emaInputCandles[i];
+      crossPoints.push({
+        time: bar.time,
+        price: curr50,
+        color: golden ? THEME.green : THEME.red,
+      });
+    }
+    return {
+      ema50: ema50Arr[ema50Arr.length - 1],
+      ema200: ema200Arr[ema200Arr.length - 1],
+      crossPoints,
+    };
+  }, [emaInputCandles]);
+  const macdData = useMemo(() => {
+    if (!emaInputCandles.length) {
+      return { macd: null, signal: null, hist: null, histogramData: [], macdLineData: [], signalLineData: [] };
+    }
+    const { macdArr, signalArr, histArr, histColorArr } = calcMACDFromCandles(emaInputCandles, 12, 26, 9);
+    const histogramData = [];
+    const macdLineData = [];
+    const signalLineData = [];
+    for (let i = 0; i < emaInputCandles.length; i++) {
+      const t = emaInputCandles[i].time;
+      if (Number.isFinite(histArr[i])) histogramData.push({ time: t, value: histArr[i], color: histColorArr[i] ?? "#787b86" });
+      if (Number.isFinite(macdArr[i])) macdLineData.push({ time: t, value: macdArr[i] });
+      if (Number.isFinite(signalArr[i])) signalLineData.push({ time: t, value: signalArr[i] });
+    }
+    return {
+      macd: macdArr[macdArr.length - 1],
+      signal: signalArr[signalArr.length - 1],
+      hist: histArr[histArr.length - 1],
+      histogramData,
+      macdLineData,
+      signalLineData,
+    };
+  }, [emaInputCandles]);
 
   // ── Init chart một lần ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -683,7 +810,48 @@ function CandlestickChart({
       lastValueVisible: false,
       priceLineVisible: false,
     });
-    volSeries.priceScale().applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
+    // 12-span layout inside chart pane:
+    // - top 8/12 for price+volume
+    // - bottom 4/12 for MACD
+    candleSeries.priceScale().applyOptions({ scaleMargins: { top: 0.02, bottom: 0.34 } });
+    volSeries.priceScale().applyOptions({ scaleMargins: { top: 0.56, bottom: 0.34 } });
+    const ema50Series = chart.addLineSeries({
+      color: THEME.red,
+      lineWidth: 1,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+    });
+    const ema200Series = chart.addLineSeries({
+      color: THEME.green,
+      lineWidth: 1,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+    });
+    const macdHistSeries = chart.addHistogramSeries({
+      priceScaleId: "macd",
+      priceLineVisible: false,
+      lastValueVisible: false,
+      base: 0,
+    });
+    const macdLineSeries = chart.addLineSeries({
+      priceScaleId: "macd",
+      color: "#2962ff",
+      lineWidth: 1,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+    });
+    const macdSignalSeries = chart.addLineSeries({
+      priceScaleId: "macd",
+      color: "#ff6d00",
+      lineWidth: 1,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+    });
+    macdHistSeries.priceScale().applyOptions({ scaleMargins: { top: 0.67, bottom: 0.02 } });
 
     chart.timeScale().subscribeVisibleTimeRangeChange(() => setOverlayKey((k) => k + 1));
 
@@ -727,6 +895,11 @@ function CandlestickChart({
     chartRef.current = chart;
     candleSeriesRef.current = candleSeries;
     volSeriesRef.current = volSeries;
+    ema50SeriesRef.current = ema50Series;
+    ema200SeriesRef.current = ema200Series;
+    macdHistSeriesRef.current = macdHistSeries;
+    macdLineSeriesRef.current = macdLineSeries;
+    macdSignalSeriesRef.current = macdSignalSeries;
 
     return () => { ro.disconnect(); chart.remove(); };
   }, []);
@@ -807,6 +980,43 @@ function CandlestickChart({
       });
     }
   }, [liveCandle]);
+
+  // ── MACD 12/26/9 panel data ──────────────────────────────────────────────────
+  useEffect(() => {
+    const hs = macdHistSeriesRef.current;
+    const ml = macdLineSeriesRef.current;
+    const sl = macdSignalSeriesRef.current;
+    if (!hs || !ml || !sl) return;
+    hs.setData(macdData.histogramData);
+    ml.setData(macdData.macdLineData);
+    sl.setData(macdData.signalLineData);
+  }, [macdData]);
+
+  // ── EMA 50/200 overlay lines ─────────────────────────────────────────────────
+  useEffect(() => {
+    const ema50Series = ema50SeriesRef.current;
+    const ema200Series = ema200SeriesRef.current;
+    if (!ema50Series || !ema200Series) return;
+    if (!emaInputCandles.length) {
+      ema50Series.setData([]);
+      ema200Series.setData([]);
+      return;
+    }
+
+    const ema50Arr = calcEMAFromCandles(emaInputCandles, 50);
+    const ema200Arr = calcEMAFromCandles(emaInputCandles, 200);
+    const ema50Data = [];
+    const ema200Data = [];
+    for (let i = 0; i < emaInputCandles.length; i++) {
+      const t = emaInputCandles[i].time;
+      const v50 = ema50Arr[i];
+      const v200 = ema200Arr[i];
+      if (Number.isFinite(v50)) ema50Data.push({ time: t, value: v50 });
+      if (Number.isFinite(v200)) ema200Data.push({ time: t, value: v200 });
+    }
+    ema50Series.setData(ema50Data);
+    ema200Series.setData(ema200Data);
+  }, [emaInputCandles]);
 
   // ── Cập nhật signal markers ─────────────────────────────────────────────────
   useEffect(() => {
@@ -1021,6 +1231,24 @@ function CandlestickChart({
     });
     return () => cancelAnimationFrame(id);
   }, [trades, overlayKey, candles.length, selectedTradeNumber]);
+
+  // Exact EMA cross positions on price coordinates
+  useEffect(() => {
+    const chart = chartRef.current;
+    const cs = candleSeriesRef.current;
+    if (!chart || !cs || !emaCrossData.crossPoints.length) {
+      setEmaCrossPositions([]);
+      return;
+    }
+    const ts = chart.timeScale();
+    const out = [];
+    for (const cp of emaCrossData.crossPoints) {
+      const x = ts.timeToCoordinate(cp.time);
+      const y = cs.priceToCoordinate(cp.price);
+      if (x != null && y != null) out.push({ x, y, color: cp.color, time: cp.time });
+    }
+    setEmaCrossPositions(out);
+  }, [emaCrossData, overlayKey, candles.length]);
 
   useEffect(() => {
     if (selectedTradeNumber == null) {
@@ -1260,6 +1488,37 @@ function CandlestickChart({
       {/* Chart + overlay tam giác ngang tại giá entry */}
       <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
         <div ref={containerRef} style={{ position: "absolute", inset: 0 }} />
+        <div
+          style={{
+            position: "absolute",
+            top: 8,
+            left: 10,
+            zIndex: 12,
+            pointerEvents: "none",
+            fontSize: 11,
+            color: THEME.textSecondary,
+            padding: "2px 0",
+            fontFamily: "'Source Code Pro', monospace",
+          }}
+        >
+          <div>
+            EMA Cross 50/200{" "}
+            <span style={{ color: THEME.green }}>
+              {Number.isFinite(emaCrossData.ema50) ? formatPrice(emaCrossData.ema50) : "—"}
+            </span>{" "}
+            <span style={{ color: THEME.red }}>
+              {Number.isFinite(emaCrossData.ema200) ? formatPrice(emaCrossData.ema200) : "—"}
+            </span>
+          </div>
+          <div>
+            MACD close 12 26 9{" "}
+            <span style={{ color: "#2962ff" }}>{formatIndicatorNumber(macdData.macd)}</span>{" "}
+            <span style={{ color: "#ff6d00" }}>{formatIndicatorNumber(macdData.signal)}</span>{" "}
+            <span style={{ color: Number.isFinite(macdData.hist) && macdData.hist >= 0 ? THEME.green : THEME.red }}>
+              {formatIndicatorNumber(macdData.hist)}
+            </span>
+          </div>
+        </div>
         <div style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 10 }}>
           <svg width="100%" height="100%" viewBox={overlaySize.w && overlaySize.h ? `0 0 ${overlaySize.w} ${overlaySize.h}` : undefined} preserveAspectRatio="none" style={{ display: "block", overflow: "visible" }}>
             {entryMarkerPositions
@@ -1296,6 +1555,20 @@ function CandlestickChart({
                 />
               );
             })}
+            {emaCrossPositions.map((pos, i) => (
+              <text
+                key={`ema-cross-${pos.time}-${i}`}
+                x={pos.x}
+                y={pos.y}
+                textAnchor="middle"
+                dominantBaseline="central"
+                fill={pos.color}
+                fontSize={24}
+                fontWeight={'bold'}
+              >
+                +
+              </text>
+            ))}
           </svg>
         </div>
       </div>
@@ -2043,6 +2316,15 @@ export default function App() {
   const { candles, liveCandle, loading, error, refetch, fetchMore, hasMoreRef, loadingMoreRef } =
     useCandleData(selectedProviderId, selectedInterval, selectedSymbol);
 
+  useEffect(() => {
+    const latest = liveCandle ?? (candles.length ? candles[candles.length - 1] : null);
+    if (!latest || !Number.isFinite(latest.close)) {
+      document.title = symbolLabel;
+      return;
+    }
+    document.title = `${formatPrice(latest.close)} | ${symbolLabel}`;
+  }, [symbolLabel, candles, liveCandle]); 
+
   // ─── Persist strategy params per symbol ──────────────────────────────────
   const STRATEGY_PARAMS_STORAGE_KEY_PREFIX = "tvbt_strategy_params_v1";
 
@@ -2173,12 +2455,10 @@ export default function App() {
     saveStrategyParams(selectedProviderId, selectedAsset, selectedStrategyId, strategyParams);
   }, [selectedProviderId, selectedAsset, selectedStrategyId, strategyParams]);
 
-  // liveCandle throttled 30s — tránh backtest recompute mỗi WS tick
+  // Keep live candle for chart/pending visual helpers only.
+  // Backtest signals/trades must use confirmed candles to avoid repaint-like behavior.
   const liveCandleForBacktest = useThrottle(liveCandle, 1000);
-  const allCandlesForBacktest = useMemo(
-    () => (liveCandleForBacktest ? [...candles, liveCandleForBacktest] : candles),
-    [candles, liveCandleForBacktest]
-  );
+  const confirmedCandlesForBacktest = useMemo(() => candles, [candles]);
 
   // Preload 1m candles for PRP v5 intrabar backtest
   useEffect(() => {
@@ -2187,15 +2467,15 @@ export default function App() {
       setPrpV5MinuteStatus("idle");
       return;
     }
-    if (!allCandlesForBacktest.length) {
+    if (!confirmedCandlesForBacktest.length) {
       setPrpV5MinuteCandles([]);
       setPrpV5MinuteStatus("idle");
       return;
     }
 
     let cancelled = false;
-    const first = allCandlesForBacktest[0];
-    const last = allCandlesForBacktest[allCandlesForBacktest.length - 1];
+    const first = confirmedCandlesForBacktest[0];
+    const last = confirmedCandlesForBacktest[confirmedCandlesForBacktest.length - 1];
     const tfMs = intervalToMinutes(selectedInterval) * 60 * 1000;
     const startMs = first.timestamp;
     const endMs = last.timestamp + tfMs;
@@ -2225,10 +2505,10 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [selectedStrategyId, allCandlesForBacktest, selectedInterval, selectedProviderId, selectedSymbol]);
+  }, [selectedStrategyId, confirmedCandlesForBacktest, selectedInterval, selectedProviderId, selectedSymbol]);
 
   const signals = useMemo(() => {
-    const allCandles = allCandlesForBacktest;
+    const allCandles = confirmedCandlesForBacktest;
     if (allCandles.length === 0) return [];
     const strategy = STRATEGY_MAP[selectedStrategyId];
     if (selectedStrategyId === "prp-pivot-psar-v5") {
@@ -2243,7 +2523,7 @@ export default function App() {
     }
     return strategy.generateSignals(allCandles, strategyParams);
   }, [
-    allCandlesForBacktest,
+    confirmedCandlesForBacktest,
     selectedStrategyId,
     strategyParams,
     prpV5MinuteCandles,
@@ -2253,10 +2533,10 @@ export default function App() {
 
   // Chạy backtest mỗi khi confirmed candles hoặc throttled live candle thay đổi
   const trades = useMemo(() => {
-    const allCandles = allCandlesForBacktest;
+    const allCandles = confirmedCandlesForBacktest;
     if (allCandles.length === 0) return [];
     return runBacktest(allCandles, signals, { positionSizeUSDT: positionSize, feePct: feePct / 100 });
-  }, [allCandlesForBacktest, signals, positionSize, feePct]);
+  }, [confirmedCandlesForBacktest, signals, positionSize, feePct]);
 
   const signalDirectionStats = useMemo(() => {
     const stats = {
@@ -2269,7 +2549,7 @@ export default function App() {
       alignedPct: 0,
     };
     for (const sig of signals) {
-      const bar = allCandlesForBacktest[sig.barIndex];
+      const bar = confirmedCandlesForBacktest[sig.barIndex];
       if (!bar) continue;
       if (sig.type === "long") {
         stats.longTotal += 1;
@@ -2283,7 +2563,7 @@ export default function App() {
     stats.alignedTotal = stats.longAligned + stats.shortAligned;
     stats.alignedPct = stats.total > 0 ? (stats.alignedTotal / stats.total) * 100 : 0;
     return stats;
-  }, [signals, allCandlesForBacktest]);
+  }, [signals, confirmedCandlesForBacktest]);
 
   const displayTrades = useMemo(() => {
     return trades;
@@ -2505,8 +2785,8 @@ export default function App() {
         onFeePctChange={setFeePct}
       />
 
-      {/* Chart — 60% height */}
-      <div style={{ flex: "0 0 60%", overflow: "hidden" }}>
+      {/* Chart — increased height to prioritize chart/indicators */}
+      <div style={{ flex: "0 0 68%", overflow: "hidden" }}>
         <CandlestickChart
           candles={candles}
           trades={trades}
@@ -2536,8 +2816,8 @@ export default function App() {
         />
       </div>
 
-      {/* Strategy report — 40% height */}
-      <div style={{ flex: "0 0 40%", overflow: "hidden" }}>
+      {/* Strategy report — pushed lower */}
+      <div style={{ flex: "0 0 32%", overflow: "hidden" }}>
         <StrategyReport
           trades={displayTrades}
           strategyName={strategy.name}
