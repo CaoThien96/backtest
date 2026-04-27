@@ -39,7 +39,8 @@ export function saveCache(state) {
   if (!storage) return;
   try {
     storage.setItem(CACHE_KEY, JSON.stringify(state));
-  } catch {
+  } catch (error) {
+    console.error("Error saving cache", error);
     // ignore quota or parse errors
   }
 }

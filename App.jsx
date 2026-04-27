@@ -40,7 +40,7 @@ const THEME = {
   blue: "#2962ff",
 };
 
-const ASSET_OPTIONS = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "LINK", "LTC", "SUI", "UNI"];
+const ASSET_OPTIONS = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "LINK", "LTC", "SUI", "UNI", "BCH", "OP", "CRV", "AVAX", "DOT"];
 const VISIBLE_PROVIDERS = PROVIDERS.filter((p) => p.id !== "kraken");
 // Provider-specific symbol mapping (used for REST/WS endpoints + cache keys)
 const ASSET_BY_PROVIDER_SYMBOL = {
@@ -56,6 +56,11 @@ const ASSET_BY_PROVIDER_SYMBOL = {
     LTC: "LTCUSDT",
     SUI: "SUIUSDT",
     UNI: "UNIUSDT",
+    BCH: "BCHUSDT",
+    OP: "OPUSDT",
+    CRV: "CRVUSDT",
+    AVAX: "AVAXUSDT",
+    DOT: "DOTUSDT",
   },
   coinbase: {
     BTC: "BTC-USD",
@@ -134,6 +139,17 @@ function formatIndicatorNumber(val) {
     minimumFractionDigits: 4,
     maximumFractionDigits: 4,
   });
+}
+
+function formatHoldDuration(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return "0m";
+  const totalMinutes = Math.floor(ms / 60000);
+  if (totalMinutes < 60) return `${totalMinutes}m`;
+  const totalHours = Math.floor(totalMinutes / 60);
+  if (totalHours < 24) return `${totalHours}h`;
+  const days = Math.floor(totalHours / 24);
+  const hours = totalHours % 24;
+  return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
 }
 
 function calcEMAFromCandles(candles, length) {
@@ -220,6 +236,10 @@ function mergeCandlesByTime(candles) {
   return [...byTime.values()].sort((a, b) => a.time - b.time);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function hasDenseMinuteCoverage(candles, startMs, endMs) {
   const expected = Math.max(0, Math.ceil((endMs - startMs) / 60000));
   if (expected === 0) return true;
@@ -245,6 +265,23 @@ async function fetchBybitMinuteRange(startMs, endMs, symbol = "BTCUSDT") {
     volume: parseFloat(c[5] ?? 0),
   }));
   return sortAndClipCandlesInRange(normalized, startMs, endMs);
+}
+
+async function fetchBybitCandlesWithLimit(interval = "30", symbol = "BTCUSDT", limit = 1000) {
+  const url = `https://api.bybit.com/v5/market/kline?symbol=${encodeURIComponent(symbol)}&category=linear&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(limit)}`;
+  const res = await window.fetch(url);
+  const data = await res.json();
+  if (data.retCode !== 0) throw new Error(data.retMsg || "Bybit API error");
+  const list = data.result?.list ?? [];
+  return [...list].reverse().map((c) => ({
+    timestamp: parseInt(c[0], 10),
+    time: Math.floor(parseInt(c[0], 10) / 1000),
+    open: parseFloat(c[1]),
+    high: parseFloat(c[2]),
+    low: parseFloat(c[3]),
+    close: parseFloat(c[4]),
+    volume: parseFloat(c[5] ?? 0),
+  }));
 }
 
 async function fetchMinuteRangeByProvider(providerId, startMs, endMs, symbol = "BTCUSDT") {
@@ -560,10 +597,10 @@ function StrategyControls({
   onParamChange,
   positionSize,
   onPositionSizeChange,
-  feePct,
-  onFeePctChange,
 }) {
   const strategy = STRATEGY_MAP[selectedId];
+  const hiddenParamKeys = new Set(["filterMode", "direction", "mfiLength", "mfiMin"]);
+  const visibleParamEntries = Object.entries(strategy.paramSchema).filter(([key]) => !hiddenParamKeys.has(key));
 
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 16, padding: "8px 14px", borderBottom: `1px solid ${THEME.bgSecondary}`, flexShrink: 0, flexWrap: "wrap" }}>
@@ -591,25 +628,11 @@ function StrategyControls({
         />
       </label>
 
-      {/* Fee per side (% of position value) */}
-      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: THEME.textSecondary }}>
-        Fee % mỗi chiều
-        <input
-          type="number"
-          value={feePct}
-          min={0}
-          max={2}
-          step={0.01}
-          onChange={(e) => onFeePctChange(Math.max(0, Math.min(2, Number(e.target.value))))}
-          style={{ width: 52, background: THEME.bgTertiary, color: THEME.textPrimary, border: `1px solid ${THEME.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 12, textAlign: "center" }}
-        />
-      </label>
-
       {/* Divider */}
       <div style={{ width: 1, height: 14, background: THEME.border }} />
 
       {/* Auto-generated param inputs */}
-      {Object.entries(strategy.paramSchema).map(([key, schema]) => (
+      {visibleParamEntries.map(([key, schema]) => (
         <label key={key} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: THEME.textSecondary }}>
           {schema.label}
           {schema.type === "number" && (
@@ -1414,7 +1437,7 @@ function CandlestickChart({
       : null;
   const rvolText =
     typeof currentRvol === "number" && Number.isFinite(currentRvol)
-      ? ` · RVOL ${currentRvol.toFixed(2)}`
+      ? `RVOL ${currentRvol.toFixed(2)}`
       : "";
   const liveBodyBiasLong = liveCandle ? getBodyBias("long", liveCandle) : null;
   const liveBodyBiasShort = liveCandle ? getBodyBias("short", liveCandle) : null;
@@ -1426,7 +1449,7 @@ function CandlestickChart({
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", background: THEME.bgPrimary }}>
       {/* Header */}
-      <div style={{ padding: "8px 14px", display: "flex", alignItems: "center", gap: 16, borderBottom: `1px solid ${THEME.bgSecondary}`, flexShrink: 0, userSelect: "none" }}>
+      <div style={{ padding: "8px 14px", display: "flex", alignItems: "center", gap: 12, borderBottom: `1px solid ${THEME.bgSecondary}`, flexShrink: 0, userSelect: "none", minWidth: 0 }}>
         <select
           value={selectedProviderId}
           onChange={(e) => onProviderChange(e.target.value)}
@@ -1445,40 +1468,131 @@ function CandlestickChart({
             <option key={asset} value={asset}>{asset}</option>
           ))}
         </select>
-        <span style={{ color: THEME.textPrimary, fontWeight: 700, fontSize: 13 }}>{symbolLabel} · {INTERVALS.find((i) => i.value === selectedInterval)?.label ?? selectedInterval}{rvolText}{bodyBiasText}</span>
+        <span style={{ color: THEME.textPrimary, fontWeight: 700, fontSize: 13, whiteSpace: "nowrap", flexShrink: 0 }}>{rvolText}{bodyBiasText}</span>
         {displayBar && (
-          <div style={{ display: "flex", gap: 10, fontSize: 12, fontFamily: "'Source Code Pro', monospace" }}>
+          <div
+            className="metrics-strip-no-scrollbar"
+            style={{
+              display: "flex",
+              gap: 8,
+              fontSize: 12,
+              fontFamily: "'Source Code Pro', monospace",
+              overflowX: "auto",
+              overflowY: "hidden",
+              scrollbarWidth: "none",
+              msOverflowStyle: "none",
+              whiteSpace: "nowrap",
+              minWidth: 0,
+              paddingBottom: 2,
+            }}
+          >
             {[["O", displayBar.open], ["H", displayBar.high], ["L", displayBar.low], ["C", displayBar.close]].map(([label, val]) => (
-              <span key={label} style={{ color: THEME.textSecondary }}>
+              <span
+                key={label}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 4,
+                  color: THEME.textSecondary,
+                  background: THEME.bgSecondary,
+                  borderRadius: 4,
+                  padding: "2px 6px",
+                  whiteSpace: "nowrap",
+                  flexShrink: 0,
+                }}
+              >
                 {label} <span style={{ color: barColor }}>{formatPrice(val)}</span>
               </span>
             ))}
             {displayBar.volume != null && (
-              <span style={{ color: THEME.textSecondary }}>Vol <span style={{ color: THEME.textPrimary }}>{displayBar.volume?.toFixed(2)}</span></span>
+              <span
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 4,
+                  color: THEME.textSecondary,
+                  background: THEME.bgSecondary,
+                  borderRadius: 4,
+                  padding: "2px 6px",
+                  whiteSpace: "nowrap",
+                  flexShrink: 0,
+                }}
+              >
+                Vol <span style={{ color: THEME.textPrimary }}>{displayBar.volume?.toFixed(2)}</span>
+              </span>
             )}
             {typeof candleRealizePct === "number" && Number.isFinite(candleRealizePct) && typeof candleMaxChangePct === "number" && Number.isFinite(candleMaxChangePct) && (
-              <span style={{ color: THEME.textSecondary }}>
+              <span
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 4,
+                  color: THEME.textSecondary,
+                  background: THEME.bgSecondary,
+                  borderRadius: 4,
+                  padding: "2px 6px",
+                  whiteSpace: "nowrap",
+                  flexShrink: 0,
+                }}
+              >
                 Chg <span style={{ color: candleRealizePct >= 0 ? THEME.green : THEME.red }}>{candleRealizePct >= 0 ? "+" : ""}{candleRealizePct.toFixed(2)}%</span>{" "}
                 <span style={{ color: THEME.textPrimary }}>({candleMaxChangePct.toFixed(2)}%)</span>
               </span>
             )}
             {typeof openTradeRR === "number" && Number.isFinite(openTradeRR) && (
-              <span style={{ color: THEME.textSecondary }}>
+              <span
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 4,
+                  color: THEME.textSecondary,
+                  background: THEME.bgSecondary,
+                  borderRadius: 4,
+                  padding: "2px 6px",
+                  whiteSpace: "nowrap",
+                  flexShrink: 0,
+                }}
+              >
                 R:R <span style={{ color: THEME.textPrimary }}>{openTradeRR.toFixed(2)}</span>
               </span>
             )}
             {tpPotentialPnL && (
-              <span style={{ color: THEME.textSecondary }}>
+              <span
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 4,
+                  color: THEME.textSecondary,
+                  background: THEME.bgSecondary,
+                  borderRadius: 4,
+                  padding: "2px 6px",
+                  whiteSpace: "nowrap",
+                  flexShrink: 0,
+                }}
+              >
                 TP <span style={{ color: tpPotentialPnL.pnl >= 0 ? THEME.green : THEME.red }}>{formatPotentialPnL(tpPotentialPnL)}</span>
               </span>
             )}
             {slPotentialPnL && (
-              <span style={{ color: THEME.textSecondary }}>
+              <span
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 4,
+                  color: THEME.textSecondary,
+                  background: THEME.bgSecondary,
+                  borderRadius: 4,
+                  padding: "2px 6px",
+                  whiteSpace: "nowrap",
+                  flexShrink: 0,
+                }}
+              >
                 SL <span style={{ color: slPotentialPnL.pnl >= 0 ? THEME.green : THEME.red }}>{formatPotentialPnL(slPotentialPnL)}</span>
               </span>
             )}
           </div>
         )}
+        <style>{`.metrics-strip-no-scrollbar::-webkit-scrollbar { display: none; }`}</style>
         <div style={{ marginLeft: "auto", fontSize: 11, color: THEME.textSecondary }}>
           {loadingMoreRef.current && "Tải thêm..."}
           {!hasMoreRef.current && candles.length > 0 && "Đã tải hết"}
@@ -2258,6 +2372,82 @@ function StrategyReport({ trades, strategyName, signalDirectionStats, onTradeSel
   );
 }
 
+function MultiSymbolOpenPositionsHeader({ rows, selectedAsset, onSelectAsset }) {
+  const openRows = (rows ?? []).filter((r) => r?.isOpen);
+  const longCount = openRows.filter((r) => r.side === "Long").length;
+  const shortCount = openRows.filter((r) => r.side === "Short").length;
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        height: "100%",
+        minHeight: 0,
+        padding: "8px 8px",
+        borderLeft: `1px solid ${THEME.bgSecondary}`,
+        background: THEME.bgPrimary,
+      }}
+    >
+      <div style={{ display: "flex", flexDirection: "column", gap: 4, padding: "2px 4px 8px 4px" }}>
+        <span style={{ color: THEME.textSecondary, fontSize: 11, fontWeight: 600 }}>
+          Open Positions
+        </span>
+        <span style={{ color: THEME.textSecondary, fontSize: 10, fontFamily: "'Source Code Pro', monospace" }}>
+          <span style={{ color: THEME.green }}>Long: {longCount}</span>{" · "}
+          <span style={{ color: THEME.red }}>Short: {shortCount}</span>
+        </span>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, overflowY: "auto", minHeight: 0 }}>
+      {openRows.length === 0 && (
+        <span style={{ fontSize: 11, color: THEME.textSecondary, padding: "2px 4px" }}>No open positions</span>
+      )}
+      {openRows.map((row) => {
+        const sideColor = row.side === "Long" ? THEME.green : row.side === "Short" ? THEME.red : THEME.textSecondary;
+        const pnlColor = row.pnlPct >= 0 ? THEME.green : THEME.red;
+        const pnlBackground = row.pnlPct >= 0 ? "rgba(34, 171, 148, 0.10)" : "rgba(242, 54, 69, 0.10)";
+        const isSelected = row.asset === selectedAsset;
+        return (
+          <div
+            key={row.symbol}
+            onClick={() => {
+              if (row.asset && onSelectAsset) onSelectAsset(row.asset);
+            }}
+            style={{
+              fontSize: 11,
+              color: THEME.textSecondary,
+              background: pnlBackground,
+              borderRadius: 4,
+              padding: "6px 7px",
+              fontFamily: "'Source Code Pro', monospace",
+              cursor: "pointer",
+              boxShadow: isSelected ? `inset 0 0 0 1px ${THEME.blue}` : "none",
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+              <span style={{ color: THEME.textPrimary }}>{row.symbol}</span>
+              <span style={{ color: sideColor }}>{row.side}</span>
+            </div>
+            <div style={{ color: pnlColor, marginTop: 5, fontSize: 12, fontWeight: 700 }}>
+              {row.pnlUSDT >= 0 ? "+$" : "-$"}
+              {Math.abs(row.pnlUSDT).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}{" "}
+              {row.pnlPct >= 0 ? "+" : ""}
+              {row.pnlPct.toFixed(2)}%
+            </div>
+            <div style={{ marginTop: 4, display: "flex", gap: 8, flexWrap: "wrap", fontSize: 10, color: THEME.textSecondary }}>
+              <span>E {formatPrice(row.entryPrice)}</span>
+              <span>C {formatPrice(row.currentPrice)}</span>
+            </div>
+            <div style={{ marginTop: 3, display: "flex", justifyContent: "flex-end", fontSize: 10, color: THEME.textSecondary }}>
+              {row.holdTimeLabel ?? "—"}
+            </div>
+          </div>
+        );
+      })}
+      </div>
+    </div>
+  );
+}
+
 // ─── Component: Loading / Error ───────────────────────────────────────────────
 function Loading() {
   return (
@@ -2280,8 +2470,11 @@ function ErrorState({ message, onRetry }) {
 
 // ─── App root ─────────────────────────────────────────────────────────────────
 export default function App() {
+  const FIXED_FEE_PCT_PER_SIDE = 0.05;
   const [selectedProviderId, setSelectedProviderId] = useState(DEFAULT_PROVIDER_ID);
   const [selectedInterval, setSelectedInterval] = useState("30");
+  const [multiSymbolFetchedCandles, setMultiSymbolFetchedCandles] = useState({});
+  const multiSymbolFetchGenerationRef = useRef(0);
   const SYMBOL_STORAGE_KEY = "tvbt_symbol_v1";
   const pickFallbackAsset = useCallback((assets) => {
     if (!assets.length) return "BTC";
@@ -2386,7 +2579,6 @@ export default function App() {
     return stored ?? getDefaultParams(STRATEGIES[0]);
   });
   const [positionSize, setPositionSize] = useState(2000);
-  const [feePct, setFeePct]             = useState(0.05); // % per side (open and close)
   const [selectedTradeForDetail, setSelectedTradeForDetail] = useState(null);
   const [selectedTradeForChart, setSelectedTradeForChart] = useState(null);
   const [selectedReplayCandle, setSelectedReplayCandle] = useState(null);
@@ -2435,6 +2627,13 @@ export default function App() {
   const handleParamChange = (key, val) => {
     setStrategyParams((prev) => ({ ...prev, [key]: val }));
   };
+
+  const effectiveStrategyParams = useMemo(() => {
+    const out = { ...(strategyParams ?? {}) };
+    if (Object.prototype.hasOwnProperty.call(out, "filterMode")) out.filterMode = "RVOL";
+    if (Object.prototype.hasOwnProperty.call(out, "direction")) out.direction = "Both";
+    return out;
+  }, [strategyParams]);
 
   // Restore params when switching provider/symbol; keep the currently selected strategy id.
   useEffect(() => {
@@ -2516,16 +2715,16 @@ export default function App() {
         return [];
       }
       const tfMinutes = intervalToMinutes(selectedInterval);
-      return strategy.generateSignals(allCandles, strategyParams, {
+      return strategy.generateSignals(allCandles, effectiveStrategyParams, {
         minuteCandles: prpV5MinuteCandles,
         tfMinutes,
       });
     }
-    return strategy.generateSignals(allCandles, strategyParams);
+    return strategy.generateSignals(allCandles, effectiveStrategyParams);
   }, [
     confirmedCandlesForBacktest,
     selectedStrategyId,
-    strategyParams,
+    effectiveStrategyParams,
     prpV5MinuteCandles,
     prpV5MinuteStatus,
     selectedInterval,
@@ -2535,8 +2734,8 @@ export default function App() {
   const trades = useMemo(() => {
     const allCandles = confirmedCandlesForBacktest;
     if (allCandles.length === 0) return [];
-    return runBacktest(allCandles, signals, { positionSizeUSDT: positionSize, feePct: feePct / 100 });
-  }, [confirmedCandlesForBacktest, signals, positionSize, feePct]);
+    return runBacktest(allCandles, signals, { positionSizeUSDT: positionSize, feePct: FIXED_FEE_PCT_PER_SIDE / 100 });
+  }, [confirmedCandlesForBacktest, signals, positionSize]);
 
   const signalDirectionStats = useMemo(() => {
     const stats = {
@@ -2566,8 +2765,238 @@ export default function App() {
   }, [signals, confirmedCandlesForBacktest]);
 
   const displayTrades = useMemo(() => {
-    return trades;
-  }, [trades]);
+    if (!trades.length) return trades;
+    const lastTrade = trades[trades.length - 1];
+    if (!lastTrade?.isOpen) return trades;
+    if (!Number.isFinite(liveCandle?.close)) return trades;
+    if (!Number.isFinite(lastTrade.entryPrice) || !Number.isFinite(lastTrade.positionSize)) return trades;
+
+    const markPrice = liveCandle.close;
+    const dir = lastTrade.type === "Long" ? 1 : -1;
+    const grossPnL = (markPrice - lastTrade.entryPrice) * dir * lastTrade.positionSize;
+    const feeOpen = Number.isFinite(lastTrade.feeOpen) ? lastTrade.feeOpen : 0;
+    const feeClose = Number.isFinite(lastTrade.feeClose) ? lastTrade.feeClose : 0;
+    const netPnL = grossPnL - feeOpen - feeClose;
+    const positionValue = Number.isFinite(lastTrade.positionValue) && lastTrade.positionValue > 0
+      ? lastTrade.positionValue
+      : 1;
+    const netPnLPercent = (netPnL / positionValue) * 100;
+
+    const prevCum = trades.length > 1
+      ? (Number.isFinite(trades[trades.length - 2]?.cumulativePnL) ? trades[trades.length - 2].cumulativePnL : 0)
+      : 0;
+    const cumulativePnL = prevCum + netPnL;
+    const initialCapital = Number.isFinite(trades[0]?.positionValue) && trades[0].positionValue > 0
+      ? trades[0].positionValue
+      : 1;
+    const cumulativePnLPercent = (cumulativePnL / initialCapital) * 100;
+
+    const updatedOpenTrade = {
+      ...lastTrade,
+      exitPrice: markPrice,
+      grossPnL,
+      netPnL,
+      netPnLPercent,
+      cumulativePnL,
+      cumulativePnLPercent,
+    };
+
+    return [...trades.slice(0, -1), updatedOpenTrade];
+  }, [trades, liveCandle]);
+
+  const multiSymbolRefreshSymbols = useMemo(() => {
+    const providerId = "bybit";
+    const assets = getAvailableAssetsForProvider(providerId);
+    return assets.map((asset) => getProviderSymbol(providerId, asset));
+  }, []);
+
+  useEffect(() => {
+    const providerId = "bybit";
+    const generation = ++multiSymbolFetchGenerationRef.current;
+    // Always fetch fresh candles for the open-positions panel.
+    setMultiSymbolFetchedCandles({});
+    async function fetchFreshCandlesForPanel() {
+      const FETCH_DELAY_MS = 150;
+      for (const symbol of multiSymbolRefreshSymbols) {
+        if (generation !== multiSymbolFetchGenerationRef.current) return;
+        const key = `${providerId}:${selectedInterval}:${symbol}`;
+        try {
+          const fetched = await fetchBybitCandlesWithLimit(selectedInterval, symbol, 1000);
+          if (generation !== multiSymbolFetchGenerationRef.current) return;
+          if (fetched.length) {
+            setMultiSymbolFetchedCandles((prev) => ({ ...prev, [key]: fetched }));
+          }
+        } catch {
+          // Keep silent; row can still render as No open when data unavailable.
+        }
+        if (generation !== multiSymbolFetchGenerationRef.current) return;
+        await sleep(FETCH_DELAY_MS);
+      }
+    }
+    fetchFreshCandlesForPanel();
+    return () => {
+      // Invalidate this run; newer generation keeps running.
+      if (multiSymbolFetchGenerationRef.current === generation) {
+        multiSymbolFetchGenerationRef.current += 1;
+      }
+    };
+  }, [selectedInterval, multiSymbolRefreshSymbols]);
+
+  const multiSymbolOpenPositions = useMemo(() => {
+    const providerId = "bybit";
+    const strategyId = "prp-pivot-psar";
+    const strategy = STRATEGY_MAP[strategyId];
+    if (!strategy?.generateSignals) return [];
+
+    const assets = getAvailableAssetsForProvider(providerId);
+    const rows = [];
+
+    for (const asset of assets) {
+      const symbol = getProviderSymbol(providerId, asset);
+      const memKey = `${providerId}:${selectedInterval}:${symbol}`;
+      let symbolCandles = multiSymbolFetchedCandles[memKey] ?? [];
+      if (!symbolCandles.length) {
+        rows.push({
+          symbol,
+          isOpen: false,
+          side: null,
+          entryPrice: null,
+          currentPrice: null,
+          pnlUSDT: 0,
+          pnlPct: 0,
+        });
+        continue;
+      }
+
+      // Keep cache candles sorted/unique before running strategy.
+      const sorted = [...symbolCandles].sort((a, b) => a.time - b.time);
+      const seen = new Set();
+      symbolCandles = sorted.filter((c) => {
+        if (!c || typeof c.time !== "number") return false;
+        if (seen.has(c.time)) return false;
+        seen.add(c.time);
+        return true;
+      });
+      if (!symbolCandles.length) {
+        rows.push({
+          symbol,
+          isOpen: false,
+          side: null,
+          entryPrice: null,
+          currentPrice: null,
+          pnlUSDT: 0,
+          pnlPct: 0,
+        });
+        continue;
+      }
+
+      const cachedParams = loadStrategyParams(providerId, asset, strategyId);
+      const params = cachedParams ?? getDefaultParams(STRATEGY_MAP[strategyId]);
+      const effectiveParams = {
+        ...params,
+        ...(Object.prototype.hasOwnProperty.call(params ?? {}, "filterMode") ? { filterMode: "RVOL" } : {}),
+        ...(Object.prototype.hasOwnProperty.call(params ?? {}, "direction") ? { direction: "Both" } : {}),
+      };
+      const symbolSignals = strategy.generateSignals(symbolCandles, effectiveParams);
+      const symbolTrades = runBacktest(symbolCandles, symbolSignals, {
+        positionSizeUSDT: positionSize,
+        feePct: FIXED_FEE_PCT_PER_SIDE / 100,
+      });
+      if (!symbolTrades.length) {
+        rows.push({
+          symbol,
+          isOpen: false,
+          side: null,
+          entryPrice: null,
+          currentPrice: null,
+          pnlUSDT: 0,
+          pnlPct: 0,
+        });
+        continue;
+      }
+      const openTrade = symbolTrades[symbolTrades.length - 1];
+      if (!openTrade?.isOpen) {
+        rows.push({
+          symbol,
+          isOpen: false,
+          side: null,
+          entryPrice: null,
+          currentPrice: null,
+          pnlUSDT: 0,
+          pnlPct: 0,
+        });
+        continue;
+      }
+
+      const lastBar = symbolCandles[symbolCandles.length - 1];
+      const liveMarkPrice = (
+        selectedProviderId === providerId &&
+        selectedSymbol === symbol &&
+        Number.isFinite(liveCandle?.close)
+      )
+        ? liveCandle.close
+        : null;
+      const currentPrice = Number.isFinite(liveMarkPrice)
+        ? liveMarkPrice
+        : (Number.isFinite(lastBar?.close) ? lastBar.close : null);
+      const markTimestamp = (
+        selectedProviderId === providerId &&
+        selectedSymbol === symbol &&
+        Number.isFinite(liveCandle?.timestamp)
+      )
+        ? liveCandle.timestamp
+        : (Number.isFinite(lastBar?.timestamp) ? lastBar.timestamp : Date.now());
+      if (!Number.isFinite(currentPrice) || !Number.isFinite(openTrade.entryPrice)) {
+        rows.push({
+          symbol,
+          isOpen: false,
+          side: null,
+          entryPrice: null,
+          currentPrice: null,
+          pnlUSDT: 0,
+          pnlPct: 0,
+        });
+        continue;
+      }
+      const pnlPct = openTrade.type === "Long"
+        ? ((currentPrice - openTrade.entryPrice) / openTrade.entryPrice) * 100
+        : ((openTrade.entryPrice - currentPrice) / openTrade.entryPrice) * 100;
+      const pnlUSDT = Number.isFinite(openTrade.netPnL)
+        ? openTrade.netPnL
+        : (openTrade.type === "Long"
+          ? (currentPrice - openTrade.entryPrice) * (openTrade.positionSize ?? 0)
+          : (openTrade.entryPrice - currentPrice) * (openTrade.positionSize ?? 0));
+
+      rows.push({
+        asset,
+        symbol,
+        isOpen: true,
+        side: openTrade.type,
+        entryPrice: openTrade.entryPrice,
+        currentPrice,
+        pnlUSDT,
+        pnlPct,
+        holdTimeLabel: formatHoldDuration(
+          markTimestamp -
+          (Number.isFinite(openTrade.entryTimestamp) ? openTrade.entryTimestamp : 0)
+        ),
+      });
+    }
+
+    rows.sort((a, b) => {
+      if (a.isOpen !== b.isOpen) return a.isOpen ? -1 : 1;
+      if (!a.isOpen && !b.isOpen) return a.symbol.localeCompare(b.symbol);
+      return a.pnlPct - b.pnlPct;
+    });
+    return rows;
+  }, [
+    selectedInterval,
+    selectedProviderId,
+    selectedSymbol,
+    liveCandle,
+    positionSize,
+    multiSymbolFetchedCandles,
+  ]);
 
   useEffect(() => {
     if (!minuteReplayTarget) {
@@ -2781,39 +3210,48 @@ export default function App() {
         onParamChange={handleParamChange}
         positionSize={positionSize}
         onPositionSizeChange={setPositionSize}
-        feePct={feePct}
-        onFeePctChange={setFeePct}
       />
 
       {/* Chart — increased height to prioritize chart/indicators */}
       <div style={{ flex: "0 0 68%", overflow: "hidden" }}>
-        <CandlestickChart
-          candles={candles}
-          trades={trades}
-          selectedTradeNumber={selectedTradeForChart?.tradeNumber ?? null}
-          liveCandle={liveCandle}
-          fetchMore={fetchMore}
-          hasMoreRef={hasMoreRef}
-          loadingMoreRef={loadingMoreRef}
-          selectedInterval={selectedInterval}
-          onIntervalChange={setSelectedInterval}
-          selectedProviderId={selectedProviderId}
-          onProviderChange={setSelectedProviderId}
-          selectedAsset={selectedAsset}
-          availableAssets={availableAssetsForProvider}
-          onAssetChange={handleAssetChange}
-          symbolLabel={symbolLabel}
-          pendingBuy={trades.length > 0 && trades[trades.length - 1].isOpen && trades[trades.length - 1].type === "Long" ? null : pendingLevels.buy}
-          pendingSell={trades.length > 0 && trades[trades.length - 1].isOpen && trades[trades.length - 1].type === "Short" ? null : pendingLevels.sell}
-          activeStopLoss={activeExitLevels.stopLoss}
-          activeTakeProfit={activeExitLevels.takeProfit}
-          pivotHighPrice={pivotLevels.pivotHigh}
-          pivotLowPrice={pivotLevels.pivotLow}
-          pivotHighTime={pivotLevels.pivotHighTime}
-          pivotLowTime={pivotLevels.pivotLowTime}
-          currentRvol={currentRvol}
-          onCandleClick={handleReplayCandleSelect}
-        />
+        <div style={{ display: "flex", height: "100%", minHeight: 0 }}>
+          <div style={{ flex: "0 0 83.3333%", minWidth: 0, overflow: "hidden" }}>
+            <CandlestickChart
+              candles={candles}
+              trades={trades}
+              selectedTradeNumber={selectedTradeForChart?.tradeNumber ?? null}
+              liveCandle={liveCandle}
+              fetchMore={fetchMore}
+              hasMoreRef={hasMoreRef}
+              loadingMoreRef={loadingMoreRef}
+              selectedInterval={selectedInterval}
+              onIntervalChange={setSelectedInterval}
+              selectedProviderId={selectedProviderId}
+              onProviderChange={setSelectedProviderId}
+              selectedAsset={selectedAsset}
+              availableAssets={availableAssetsForProvider}
+              onAssetChange={handleAssetChange}
+              symbolLabel={symbolLabel}
+              pendingBuy={trades.length > 0 && trades[trades.length - 1].isOpen && trades[trades.length - 1].type === "Long" ? null : pendingLevels.buy}
+              pendingSell={trades.length > 0 && trades[trades.length - 1].isOpen && trades[trades.length - 1].type === "Short" ? null : pendingLevels.sell}
+              activeStopLoss={activeExitLevels.stopLoss}
+              activeTakeProfit={activeExitLevels.takeProfit}
+              pivotHighPrice={pivotLevels.pivotHigh}
+              pivotLowPrice={pivotLevels.pivotLow}
+              pivotHighTime={pivotLevels.pivotHighTime}
+              pivotLowTime={pivotLevels.pivotLowTime}
+              currentRvol={currentRvol}
+              onCandleClick={handleReplayCandleSelect}
+            />
+          </div>
+          <div style={{ flex: "0 0 16.6667%", minWidth: 180, overflow: "hidden" }}>
+            <MultiSymbolOpenPositionsHeader
+              rows={multiSymbolOpenPositions}
+              selectedAsset={selectedAsset}
+              onSelectAsset={handleAssetChange}
+            />
+          </div>
+        </div>
       </div>
 
       {/* Strategy report — pushed lower */}
